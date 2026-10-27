@@ -364,6 +364,7 @@ function App() {
         if (payload.theme === 'dark' || payload.theme === 'light') setTheme(payload.theme)
         if (Array.isArray(payload.panelOrder) && payload.panelOrder.every(value => typeof value === 'string' && PANEL_ORDER.includes(value as PanelKey)) && payload.panelOrder.length === PANEL_ORDER.length && new Set(payload.panelOrder).size === PANEL_ORDER.length) setPanelOrder(payload.panelOrder as PanelKey[])
         if (typeof payload.reduceMotion === 'boolean') setReduceMotion(payload.reduceMotion)
+        if (validateStudyGoals(payload.studyGoals)) setStudyGoals(payload.studyGoals)
         setNotice('پشتیبان با موفقیت بازیابی شد.')
       } catch { setNotice('فایل پشتیبان معتبر نیست یا ساختار آن شناخته نشد.') }
     }
