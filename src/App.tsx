@@ -356,7 +356,7 @@ function App() {
     const reader = new FileReader()
     reader.onload = () => {
       try {
-        const payload = JSON.parse(String(reader.result)) as { reviews?: unknown; performance?: unknown; intervals?: unknown; theme?: unknown; panelOrder?: unknown; reduceMotion?: unknown }
+        const payload = JSON.parse(String(reader.result)) as { reviews?: unknown; performance?: unknown; intervals?: unknown; theme?: unknown; panelOrder?: unknown; reduceMotion?: unknown; studyGoals?: unknown }
         if (!validReviewArray(payload.reviews) || !validPerformanceArray(payload.performance)) throw new Error('invalid backup')
         if (!window.confirm(`پشتیبان شامل ${formatFa(payload.reviews.length)} موعد مرور و ${formatFa(payload.performance.length)} رکورد عملکرد است. اطلاعات فعلی با آن جایگزین شود؟`)) return
         setReviewRecords(payload.reviews); setPerformanceRecords(payload.performance)
