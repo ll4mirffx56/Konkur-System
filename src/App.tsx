@@ -193,6 +193,7 @@ function App() {
   useEffect(() => { try { localStorage.setItem(STORE.performance, JSON.stringify(performanceRecords)) } catch { setNotice('فضای ذخیره‌سازی مرورگر در دسترس نیست؛ از پشتیبان‌گیری استفاده کن.') } }, [performanceRecords])
   useEffect(() => { try { localStorage.setItem(STORE.panelOrder, JSON.stringify(panelOrder)) } catch { /* layout still works in this session */ } }, [panelOrder])
   useEffect(() => { try { localStorage.setItem(STORE.intervals, JSON.stringify(intervals)) } catch { /* settings still work in this session */ } }, [intervals])
+  useEffect(() => { try { localStorage.setItem(STORE.studyGoals, JSON.stringify(studyGoals)) } catch { setNotice('ذخیرهٔ هدف‌ها انجام نشد.') } }, [studyGoals])
   useEffect(() => {
     if (!searchOpen) return
     setCommandQuery(''); setCommandIndex(0); window.setTimeout(() => commandInputRef.current?.focus(), 0)
