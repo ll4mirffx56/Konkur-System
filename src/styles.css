@@ -543,3 +543,18 @@ h1 span { color: var(--accent); }
   .performance-row { font-size: 9px; }
   .performance-row strong { min-width: 78px; }
 }
+
+/* Cloud account and manual sync controls */
+.cloud-panel { padding-bottom: 20px; }
+.cloud-auth-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 0 21px; }
+.cloud-auth-form .form-actions { grid-column: 1 / -1; margin-top: 4px; }
+.cloud-actions { flex-wrap: wrap; padding: 0 21px; }
+.cloud-panel .form-info { margin: 0 21px; }
+.cloud-panel .table-panel-heading { align-items: center; }
+.cloud-panel button:disabled { opacity: .55; cursor: not-allowed; }
+@media (max-width: 600px) {
+  .cloud-auth-form { grid-template-columns: 1fr; padding-inline: 13px; }
+  .cloud-auth-form .form-actions { grid-column: auto; }
+  .cloud-actions { padding-inline: 13px; }
+  .cloud-panel .form-info { margin-inline: 13px; }
+}
