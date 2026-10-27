@@ -7,14 +7,15 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "tsc src/logic.ts --outDir .test-tmp --module ESNext --target ES2020 --skipLibCheck --moduleResolution bundler && node --test tests/logic.test.mjs tests/features.test.mjs tests/final-features.test.mjs"
+    "test": "tsc src/logic.ts --outDir .test-tmp --module ESNext --target ES2020 --skipLibCheck --moduleResolution bundler && node --test tests/logic.test.mjs tests/features.test.mjs tests/final-features.test.mjs tests/cloud-features.test.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "xlsx": "^0.18.5",
-    "jalaali-js": "^2.0.1"
+    "jalaali-js": "^2.0.1",
+    "@supabase/supabase-js": "^2.76.1"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",

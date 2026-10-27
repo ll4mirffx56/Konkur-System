@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import * as XLSX from 'xlsx'
+import type { Session } from '@supabase/supabase-js'
+import { cloudConfigured, supabase, type MoroorCloudPayload } from './cloud'
 import { toGregorian, toJalaali } from 'jalaali-js'
 import { addDaysISO, buildReviewSchedule, createLineChartGeometry, daysUntilISO, filterCommandItems, getPerformanceMetrics, isValidISODate, matchesReviewFilters, reorderPanels, type PanelKey } from './logic'
 import {
@@ -106,6 +108,11 @@ function App() {
   const [today, setToday] = useState(todayISO)
   const [activePage, setActivePage] = useState<PageKey>('dashboard')
   const [notice, setNotice] = useState('')
+  const [cloudSession, setCloudSession] = useState<Session | null>(null)
+  const [cloudEmail, setCloudEmail] = useState('')
+  const [cloudPassword, setCloudPassword] = useState('')
+  const [cloudBusy, setCloudBusy] = useState(false)
+  const [cloudReady, setCloudReady] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
   const [commandQuery, setCommandQuery] = useState('')
   const [commandIndex, setCommandIndex] = useState(0)
@@ -166,6 +173,13 @@ function App() {
     }
     syncServerDate()
     return () => { cancelled = true }
+  }, [])
+  useEffect(() => {
+    if (!supabase) { setCloudReady(true); return }
+    let alive = true
+    supabase.auth.getSession().then(({ data }) => { if (alive) { setCloudSession(data.session); setCloudReady(true) } })
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => { setCloudSession(session); setCloudReady(true) })
+    return () => { alive = false; listener.subscription.unsubscribe() }
   }, [])
   useEffect(() => { document.documentElement.dataset.theme = theme; try { localStorage.setItem(STORE.theme, theme) } catch { /* storage unavailable */ } }, [theme])
   useEffect(() => { document.documentElement.dataset.reduceMotion = reduceMotion ? 'true' : 'false'; try { localStorage.setItem(STORE.reduceMotion, String(reduceMotion)) } catch { /* storage unavailable */ } }, [reduceMotion])
@@ -231,6 +245,70 @@ function App() {
     setPerformanceRecords(current => [...current.filter(item => item.date !== parsedPerformanceDate), entry].sort((a, b) => a.date.localeCompare(b.date)))
     setShowPerformanceForm(false); setNotice('عملکرد روز ذخیره شد.')
   }
+  async function cloudSignIn(event: FormEvent) {
+    event.preventDefault()
+    if (!supabase) { setNotice('اتصال ابری هنوز تنظیم نشده است. ابتدا متغیرهای محیطی Supabase را تنظیم کن.'); return }
+    if (!cloudEmail.trim() || cloudPassword.length < 6) { setNotice('ایمیل معتبر و رمز عبور حداقل ۶ حرفی وارد کن.'); return }
+    setCloudBusy(true)
+    try {
+      const { error } = await supabase.auth.signInWithPassword({ email: cloudEmail.trim(), password: cloudPassword })
+      if (error) throw error
+      setCloudPassword('')
+      setNotice('ورود موفق بود. برای انتقال اطلاعات، «ارسال اطلاعات به ابر» را جداگانه اجرا کن.')
+    } catch (error) { setNotice(error instanceof Error ? `ورود ناموفق بود: ${error.message}` : 'ورود ناموفق بود.') }
+    finally { setCloudBusy(false) }
+  }
+  async function cloudSignUp() {
+    if (!supabase) { setNotice('اتصال ابری هنوز تنظیم نشده است.'); return }
+    if (!cloudEmail.trim() || cloudPassword.length < 6) { setNotice('ایمیل معتبر و رمز عبور حداقل ۶ حرفی وارد کن.'); return }
+    setCloudBusy(true)
+    try {
+      const { data, error } = await supabase.auth.signUp({ email: cloudEmail.trim(), password: cloudPassword })
+      if (error) throw error
+      if (!data.session) setNotice('حساب ساخته شد. ایمیلت را برای تأیید بررسی کن؛ سپس وارد شو.')
+      else setNotice('حساب ساخته شد و وارد شدی. حالا می‌توانی اطلاعات را به ابر بفرستی.')
+      setCloudPassword('')
+    } catch (error) { setNotice(error instanceof Error ? `ساخت حساب ناموفق بود: ${error.message}` : 'ساخت حساب ناموفق بود.') }
+    finally { setCloudBusy(false) }
+  }
+  async function cloudSignOut() {
+    if (!supabase) return
+    const { error } = await supabase.auth.signOut()
+    setNotice(error ? `خروج ناموفق بود: ${error.message}` : 'از حساب ابری خارج شدی. اطلاعات محلی این دستگاه دست‌نخورده ماند.')
+  }
+  function currentCloudPayload(): MoroorCloudPayload {
+    return { version: 1, reviews: reviewRecords, performance: performanceRecords, intervals, theme, panelOrder, reduceMotion }
+  }
+  async function uploadCloudState() {
+    if (!supabase || !cloudSession?.user) { setNotice('برای همگام‌سازی ابتدا وارد حساب ابری شو.'); return }
+    if (!window.confirm('اطلاعات فعلی همین دستگاه در فضای ابری ذخیره و جایگزین نسخهٔ ابری قبلی می‌شود. ادامه می‌دهی؟')) return
+    setCloudBusy(true)
+    try {
+      const { error } = await supabase.from('user_app_state').upsert({ user_id: cloudSession.user.id, payload: currentCloudPayload(), updated_at: new Date().toISOString() })
+      if (error) throw error
+      setNotice('اطلاعات فعلی این دستگاه در فضای ابری ذخیره شد.')
+    } catch (error) { setNotice(error instanceof Error ? `ذخیرهٔ ابری ناموفق بود: ${error.message}` : 'ذخیرهٔ ابری ناموفق بود.') }
+    finally { setCloudBusy(false) }
+  }
+  async function downloadCloudState() {
+    if (!supabase || !cloudSession?.user) { setNotice('برای دریافت اطلاعات ابتدا وارد حساب ابری شو.'); return }
+    if (!window.confirm('اطلاعات محلی این دستگاه با نسخهٔ ابری جایگزین می‌شود. قبل از ادامه از اطلاعات فعلی پشتیبان بگیر. ادامه می‌دهی؟')) return
+    setCloudBusy(true)
+    try {
+      const { data, error } = await supabase.from('user_app_state').select('payload').eq('user_id', cloudSession.user.id).maybeSingle()
+      if (error) throw error
+      const payload = data?.payload as Partial<MoroorCloudPayload> | undefined
+      if (!payload || payload.version !== 1 || !validReviewArray(payload.reviews) || !validPerformanceArray(payload.performance)) throw new Error('نسخهٔ ابری وجود ندارد یا ساختار آن معتبر نیست؛ ابتدا از دستگاهی که اطلاعات دارد، ارسال اطلاعات به ابر را اجرا کن.')
+      setReviewRecords(payload.reviews); setPerformanceRecords(payload.performance)
+      if (Array.isArray(payload.intervals) && payload.intervals.length === 5 && payload.intervals.every(v => Number.isInteger(v) && v > 0 && v <= 365) && new Set(payload.intervals).size === 5) setIntervals(payload.intervals)
+      if (payload.theme === 'dark' || payload.theme === 'light') setTheme(payload.theme)
+      if (Array.isArray(payload.panelOrder) && payload.panelOrder.length === PANEL_ORDER.length && payload.panelOrder.every(v => PANEL_ORDER.includes(v as PanelKey)) && new Set(payload.panelOrder).size === PANEL_ORDER.length) setPanelOrder(payload.panelOrder as PanelKey[])
+      if (typeof payload.reduceMotion === 'boolean') setReduceMotion(payload.reduceMotion)
+      setNotice('اطلاعات ابری روی این دستگاه بازیابی شد.')
+    } catch (error) { setNotice(error instanceof Error ? `بازیابی ابری ناموفق بود: ${error.message}` : 'بازیابی ابری ناموفق بود.') }
+    finally { setCloudBusy(false) }
+  }
+
   function exportBackup() {
     const payload = { app: 'moroor', version: 1, exportedAt: new Date().toISOString(), intervals, reviews: reviewRecords, performance: performanceRecords, theme, panelOrder, reduceMotion }
     safeDownload(`moroor-backup-${today}.json`, JSON.stringify(payload, null, 2))
@@ -352,7 +430,7 @@ function App() {
       <div className="brand"><div className="brand-mark"><BookOpenCheck size={21} strokeWidth={2.3} /></div><div className="brand-copy"><strong>مــرور</strong><span>STUDY OS</span></div></div>
       <div className="workspace-label">فضای کاری</div>
       <nav className="main-nav" aria-label="ناوبری اصلی">{NAV.map(({ key, label, icon: Icon }) => <button key={key} className={`nav-item ${activePage === key ? 'active' : ''}`} onClick={() => setActivePage(key)}><Icon size={18} /><span>{label}</span>{key === 'reviews' && <span className="nav-count">{formatFa(todayReviews + overdueReviews)}</span>}</button>)}</nav>
-      <div className="sidebar-bottom"><div className="focus-card"><div className="focus-card-top"><span className="focus-icon"><Flame size={16} /></span><span>موعدهای باز</span></div><div className="focus-number">{formatFa(todayReviews + overdueReviews)} <small>مرور امروز و عقب‌افتاده</small></div><div className="streak-track"><span style={{ width: `${reviews.length ? Math.min(100, reviews.filter(item => item.done).length / reviews.length * 100) : 0}%` }} /></div><p>ثبت و پیگیری را از همین‌جا ادامه بده.</p></div><button className="help-link" onClick={() => setNotice('تاریخ‌ها با ساعت محلی دستگاه محاسبه و به تقویم جلالی نمایش داده می‌شوند.')}><CircleHelp size={17} /> راهنمای تاریخ‌ها</button><div className="profile"><div className="avatar">م</div><div className="profile-info"><strong>فضای شخصی</strong><span>ذخیرهٔ محلی در مرورگر</span></div><MoreHorizontal size={19} className="muted-icon" /></div></div>
+      <div className="sidebar-bottom"><div className="focus-card"><div className="focus-card-top"><span className="focus-icon"><Flame size={16} /></span><span>موعدهای باز</span></div><div className="focus-number">{formatFa(todayReviews + overdueReviews)} <small>مرور امروز و عقب‌افتاده</small></div><div className="streak-track"><span style={{ width: `${reviews.length ? Math.min(100, reviews.filter(item => item.done).length / reviews.length * 100) : 0}%` }} /></div><p>ثبت و پیگیری را از همین‌جا ادامه بده.</p></div><button className="help-link" onClick={() => setNotice('تاریخ‌ها با ساعت محلی دستگاه محاسبه و به تقویم جلالی نمایش داده می‌شوند.')}><CircleHelp size={17} /> راهنمای تاریخ‌ها</button><div className="profile"><div className="avatar">م</div><div className="profile-info"><strong>فضای شخصی</strong><span>{cloudSession ? 'حساب ابری متصل' : 'ذخیرهٔ محلی در مرورگر'}</span></div><MoreHorizontal size={19} className="muted-icon" /></div></div>
     </aside>
 
     <main className="main-content">
@@ -390,6 +468,9 @@ function App() {
 
       {activePage === 'settings' && <div className="page-wrap page-enter settings-page"><section className="welcome-row"><div><div className="eyebrow"><span className="status-dot" /> تنظیمات برنامه</div><h1>تنظیمات <span>و داده‌ها</span></h1><p className="page-subtitle">فاصله‌های مرور، ظاهر و مدیریت پشتیبان اطلاعات.</p></div></section>
         <section className="panel interval-settings"><div className="table-panel-heading"><div><h2>فاصله‌های مرور</h2><p>با تغییر فاصله، موعدهای موجود نیز از تاریخ شروع دوباره محاسبه می‌شوند.</p></div></div><div className="interval-fields">{intervals.map((value, index) => <label className="select-field" key={index}><span>مرور شمارهٔ {formatFa(index + 1)} (روز)</span><input type="number" min="1" max="365" value={value} onChange={event => updateIntervals(index, event.target.value)} /></label>)}</div></section>
+        <section className="panel interval-settings cloud-panel"><div className="table-panel-heading"><div><h2>حساب و همگام‌سازی ابری</h2><p>اطلاعات فقط با اقدام خودت ارسال یا دریافت می‌شود؛ همگام‌سازی خودکار در این نسخه فعال نیست.</p></div><span className={`status-dot ${cloudSession ? '' : 'muted'}`} /></div>
+          {!cloudConfigured() ? <div className="form-info"><CircleHelp size={16} /><span>اتصال Supabase تنظیم نشده است. فایل راهنمای CLOUD-SETUP.md را دنبال کن و متغیرهای محیطی را در تنظیمات GitHub وارد کن.</span></div> : !cloudSession ? <form className="cloud-auth-form" onSubmit={cloudSignIn}><label className="form-field"><span>ایمیل</span><input type="email" autoComplete="email" value={cloudEmail} onChange={event => setCloudEmail(event.target.value)} required placeholder="you@example.com" /></label><label className="form-field"><span>رمز عبور</span><input type="password" autoComplete="current-password" minLength={6} value={cloudPassword} onChange={event => setCloudPassword(event.target.value)} required /></label><div className="form-actions"><button className="secondary-button" type="button" disabled={cloudBusy || !cloudReady} onClick={cloudSignUp}>ساخت حساب</button><button className="primary-button" type="submit" disabled={cloudBusy || !cloudReady}>{cloudBusy ? 'در حال انجام…' : 'ورود'}</button></div></form> : <><div className="form-info"><CircleCheck size={16} /><span>وارد شده‌ای: {cloudSession.user.email ?? 'حساب کاربری'}</span></div><div className="form-actions cloud-actions"><button className="secondary-button" disabled={cloudBusy} onClick={uploadCloudState}>ارسال اطلاعات به ابر</button><button className="secondary-button" disabled={cloudBusy} onClick={downloadCloudState}>دریافت از ابر</button><button className="secondary-button" disabled={cloudBusy} onClick={cloudSignOut}>خروج</button></div></>}
+        </section>
         <section className="settings-grid"><div className="panel settings-card"><div className="setting-symbol"><Sun size={19} /></div><div className="setting-copy"><strong>تم رنگی</strong><p>میان حالت تیره و روشن جابه‌جا شو.</p></div><button className="theme-setting-button" onClick={() => setTheme(value => value === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <><Sun size={16} /> حالت روشن</> : <><Moon size={16} /> حالت تیره</>}</button></div>
           <div className="panel settings-card"><div className="setting-symbol"><Zap size={19} /></div><div className="setting-copy"><strong>کاهش حرکت</strong><p>حرکت‌ها و انتقال‌های تزئینی را محدود کن.</p></div><button className={`switch ${reduceMotion ? 'on' : ''}`} role="switch" aria-checked={reduceMotion} onClick={() => setReduceMotion(value => !value)}><span /></button></div>
           <div className="panel settings-card"><div className="setting-symbol"><Download size={19} /></div><div className="setting-copy"><strong>پشتیبان JSON</strong><p>نسخه‌ای از همهٔ مرورها، عملکرد و تنظیمات ذخیره کن.</p></div><button className="secondary-button" onClick={exportBackup}><Download size={15} /> دریافت</button></div>
@@ -397,7 +478,7 @@ function App() {
           <div className="panel settings-card"><div className="setting-symbol"><FileSpreadsheet size={19} /></div><div className="setting-copy"><strong>خروجی اکسل</strong><p>فهرست مرور و عملکرد را در دو برگه ذخیره کن.</p></div><button className="secondary-button" onClick={exportExcel}><Download size={15} /> خروجی</button></div>
           <div className="panel settings-card"><div className="setting-symbol"><GripVertical size={19} /></div><div className="setting-copy"><strong>چیدمان داشبورد</strong><p>ترتیب کارت‌ها را به حالت اولیه برگردان.</p></div><button className="secondary-button" onClick={() => { setPanelOrder(PANEL_ORDER); setNotice('چیدمان داشبورد بازنشانی شد.') }}><RotateCcw size={15} /> بازنشانی</button></div>
         </section>
-        <div className="settings-disclaimer"><CircleHelp size={16} /><span>تاریخ امروز از ساعت محلی دستگاه گرفته و با الگوریتم تقویم جلالی تبدیل می‌شود؛ برای این کار اتصال به Google یا اینترنت لازم نیست. اطلاعات در همین مرورگر ذخیره می‌شود و بین دستگاه‌ها خودکار همگام نمی‌شود؛ پشتیبان را در جای امن نگه دار.</span></div>
+        <div className="settings-disclaimer"><CircleHelp size={16} /><span>تاریخ امروز از ساعت محلی دستگاه گرفته و با الگوریتم تقویم جلالی تبدیل می‌شود؛ برای این کار اتصال به Google یا اینترنت لازم نیست. اطلاعات محلی در همین مرورگر ذخیره می‌شود. برای همگام‌سازی، از بخش حساب و همگام‌سازی ابری به‌صورت دستی ارسال یا دریافت کن؛ پیش از جایگزینی داده‌ها پشتیبان بگیر.</span></div>
         <input ref={importInputRef} type="file" accept=".json,.xlsx,.xls,.xlsm" hidden onChange={event => { handleImport(event.target.files?.[0]); event.currentTarget.value = '' }} />
       </div>}
     </main>
