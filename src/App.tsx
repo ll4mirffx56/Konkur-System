@@ -297,7 +297,7 @@ function App() {
     setNotice(error ? `خروج ناموفق بود: ${error.message}` : 'از حساب ابری خارج شدی. اطلاعات محلی این دستگاه دست‌نخورده ماند.')
   }
   function currentCloudPayload(): MoroorCloudPayload {
-    return { version: 1, reviews: reviewRecords, performance: performanceRecords, intervals, theme, panelOrder, reduceMotion }
+    return { version: 1, reviews: reviewRecords, performance: performanceRecords, intervals, theme, panelOrder, reduceMotion, studyGoals }
   }
   async function uploadCloudState() {
     if (!supabase || !cloudSession?.user) { setNotice('برای همگام‌سازی ابتدا وارد حساب ابری شو.'); return }
