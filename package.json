@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "test": "tsc src/logic.ts --outDir .test-tmp --module ESNext --target ES2020 --skipLibCheck --moduleResolution bundler && node --test tests/logic.test.mjs tests/features.test.mjs tests/final-features.test.mjs tests/cloud-features.test.mjs"
+    "test": "tsc src/logic.ts src/goalExam.ts --outDir .test-tmp --module ESNext --target ES2020 --skipLibCheck --moduleResolution bundler && node --test tests/logic.test.mjs tests/features.test.mjs tests/final-features.test.mjs tests/cloud-features.test.mjs tests/goal-exam.test.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
