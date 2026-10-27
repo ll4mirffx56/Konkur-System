@@ -219,6 +219,19 @@ function App() {
   function toggleReview(id: string) {
     setReviewRecords(current => current.map(item => item.id === id ? { ...item, done: !item.done, doneAt: item.done ? null : today } : item))
   }
+  function updateStudyGoal(key: keyof StudyGoalSettings, rawValue: string) {
+  if (rawValue.trim() === '') return
+
+  const value = Number(rawValue)
+  const max = key === 'weeklyHours' ? 168 : 744
+
+  if (!Number.isFinite(value) || value < 0 || value > max) {
+    setNotice(`هدف ${key === 'weeklyHours' ? 'هفتگی' : 'ماهانه'} باید بین ۰ و ${max} ساعت باشد.`)
+    return
+  }
+
+  setStudyGoals(current => ({ ...current, [key]: value }))
+}
   function deleteReview(id: string) {
     const item = reviewRecords.find(review => review.id === id)
     if (!item || !window.confirm(`«${item.title} · ${item.stage}» حذف شود؟`)) return
