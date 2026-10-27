@@ -121,6 +121,10 @@ function App() {
   const [reviewRecords, setReviewRecords] = useState<ReviewItem[]>(() => readStored<ReviewItem[]>(STORE.reviews, []))
   const [performanceRecords, setPerformanceRecords] = useState<PerformanceRecord[]>(() => readStored<PerformanceRecord[]>(STORE.performance, []))
   const [intervals, setIntervals] = useState<number[]>(() => readStored<number[]>(STORE.intervals, DEFAULT_INTERVALS))
+  const [studyGoals, setStudyGoals] = useState<StudyGoalSettings>(() => {
+  const stored = readStored<unknown>(STORE.studyGoals, DEFAULT_STUDY_GOALS)
+  return validateStudyGoals(stored) ? stored : DEFAULT_STUDY_GOALS
+})
   const [panelOrder, setPanelOrder] = useState<PanelKey[]>(() => {
     const stored = readStored<PanelKey[]>(STORE.panelOrder, PANEL_ORDER)
     const valid = stored.filter(key => PANEL_ORDER.includes(key))
