@@ -324,6 +324,7 @@ function App() {
       if (payload.theme === 'dark' || payload.theme === 'light') setTheme(payload.theme)
       if (Array.isArray(payload.panelOrder) && payload.panelOrder.length === PANEL_ORDER.length && payload.panelOrder.every(v => PANEL_ORDER.includes(v as PanelKey)) && new Set(payload.panelOrder).size === PANEL_ORDER.length) setPanelOrder(payload.panelOrder as PanelKey[])
       if (typeof payload.reduceMotion === 'boolean') setReduceMotion(payload.reduceMotion)
+      if (validateStudyGoals(payload.studyGoals)) setStudyGoals(payload.studyGoals)
       setNotice('اطلاعات ابری روی این دستگاه بازیابی شد.')
     } catch (error) { setNotice(error instanceof Error ? `بازیابی ابری ناموفق بود: ${error.message}` : 'بازیابی ابری ناموفق بود.') }
     finally { setCloudBusy(false) }
