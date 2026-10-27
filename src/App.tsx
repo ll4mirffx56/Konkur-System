@@ -348,7 +348,13 @@ function App() {
     })
     const perfRows: (string | number)[][] = [['گزارش عملکرد مطالعه'], [], ['تاریخ', 'ساعت مطالعه', 'ساعت برنامه', 'تعداد تست', 'صحیح', 'غلط', 'نزده', 'تمرکز (۰ تا ۱۰)']]
     performanceRecords.forEach(item => perfRows.push([isoToJalali(item.date), item.hours, item.planned, item.tests, item.correct, item.wrong, item.blank, item.focus]))
-    const settingsRows: (string | number)[][] = [['تنظیمات'], [], ['سال', 1406], ...intervals.map((value, index) => [`فاصله مرور ${index + 1}`, value])]
+    const settingsRows: (string | number)[][] = [
+  ['تنظیمات'], [],
+  ['سال', 1406],
+  ...intervals.map((value, index) => [`فاصله مرور ${index + 1}`, value]),
+  ['هدف ساعت هفتگی', studyGoals.weeklyHours],
+  ['هدف ساعت ماهانه', studyGoals.monthlyHours],
+]
     const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(reviewRows), 'مرور'); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(perfRows), 'عملکرد'); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(settingsRows), 'تنظیمات')
     XLSX.writeFile(wb, `moroor-export-${today}.xlsx`); setNotice('فایل اکسل خروجی ساخته شد.')
   }
