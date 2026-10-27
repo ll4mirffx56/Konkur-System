@@ -10,6 +10,7 @@ import {
   LayoutDashboard, ListChecks, Moon, MoreHorizontal, MoveDown, MoveUp, Plus, RotateCcw,
   Search, Settings2, SlidersHorizontal, Sun, Target, TrendingUp, Upload, X, Zap, Trash2,
 } from 'lucide-react'
+import { DEFAULT_STUDY_GOALS, validateStudyGoals, type StudyGoalSettings } from './goalExam'
 
 type PageKey = 'dashboard' | 'reviews' | 'performance' | 'settings'
 type ReviewItem = {
@@ -26,6 +27,7 @@ type CommandItem = { id: string; label: string; description: string; keywords: s
 const STORE = {
   theme: 'moroor-theme', reviews: 'moroor-reviews-v4', performance: 'moroor-performance-v1',
   panelOrder: 'moroor-panel-order-v3', reduceMotion: 'moroor-reduced-motion-v1', intervals: 'moroor-review-intervals-v1',
+  studyGoals: 'moroor-study-goals-v1',
 }
 const DEFAULT_INTERVALS = [1, 3, 7, 30, 90]
 const PANEL_ORDER: PanelKey[] = ['weekly', 'goal', 'reviews', 'quick']
