@@ -331,7 +331,7 @@ function App() {
   }
 
   function exportBackup() {
-    const payload = { app: 'moroor', version: 1, exportedAt: new Date().toISOString(), intervals, reviews: reviewRecords, performance: performanceRecords, theme, panelOrder, reduceMotion }
+    const payload = { app: 'moroor', version: 1, exportedAt: new Date().toISOString(), intervals, reviews: reviewRecords, performance: performanceRecords, theme, panelOrder, reduceMotion, studyGoals }
     safeDownload(`moroor-backup-${today}.json`, JSON.stringify(payload, null, 2))
     setNotice('پشتیبان JSON آماده شد.')
   }
