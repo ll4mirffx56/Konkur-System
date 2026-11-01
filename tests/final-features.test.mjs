@@ -14,18 +14,18 @@ const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8')
 })
 
 test('Jalali date entry is converted and round-trip validated', () => {
-  assert.match(app, /import \{ toGregorian, toJalaali \} from 'jalaali-js'/)
+  assert.match(app, /import \{ jalaaliMonthLength, toGregorian, toJalaali \} from 'jalaali-js'/)
   assert.match(app, /function jalaliToISO/)
   assert.match(app, /check\.jy !== jy \|\| check\.jm !== jm \|\| check\.jd !== jd/)
-  assert.match(app, /inputMode="numeric" value=\{reviewBaseDateText\}/)
-  assert.match(app, /inputMode="numeric" value=\{performanceDateText\}/)
+  assert.match(app, /<PersianDatePicker label="تاریخ اتمام جلسه" value=\{reviewBaseDateText\} onChange=\{setReviewBaseDateText\} todayDate=\{today\} \/>/)
+  assert.match(app, /<PersianDatePicker label="تاریخ عملکرد" value=\{performanceDateText\} onChange=\{setPerformanceDateText\} todayDate=\{today\} \/>/)
 })
 
 test('performance entry validates counts and computes real metrics from saved records', () => {
-  assert.match(app, /correct \+ wrong \+ blank > tests/)
+  assert.match(app, /validateExamCounts\(\{ total: tests, correct, wrong, blank \}\)/)
   assert.match(app, /setPerformanceRecords\(current => \[\.\.\.current\.filter\(item => item\.date !== parsedPerformanceDate\), entry\]/)
   assert.match(app, /getPerformanceMetrics\(chartPoints\)/)
-  assert.match(app, /درصد پاسخ صحیح/)
+  assert.match(app, /درصد آزمون با نمرهٔ منفی/)
 })
 
 test('JSON backup and workbook import/export are wired', () => {
@@ -40,14 +40,15 @@ test('JSON backup and workbook import/export are wired', () => {
 
 test('no demo review or performance rows are seeded as user data', () => {
   assert.match(app, /readStored<ReviewItem\[]>\(STORE\.reviews, \[\]\)/)
-  assert.match(app, /readStored<PerformanceRecord\[]>\(STORE\.performance, \[\]\)/)
+  assert.match(app, /readPerformanceRecords\(\)/)
+  assert.match(app, /readStored<unknown>\(STORE\.performance, \[\]\)/)
   assert.doesNotMatch(app, /const initialReviews\s*=/)
   assert.doesNotMatch(app, /const performanceData\s*=/)
 })
 
-test('documentation explains local date source and local-only persistence', () => {
+test('documentation explains date source, account-scoped cloud persistence and automated tests', () => {
   assert.match(app, /headers\.get\('Date'\)/)
-  assert.match(readme, /هدر استاندارد `Date` پاسخ سایت/)
-  assert.match(readme, /localStorage.*همان مرورگر/)
+  assert.match(readme, /هدر `Date` پاسخ سایت/)
+  assert.match(readme, /Supabase|حساب|فضای ابری/)
   assert.match(readme, /npm test/)
 })

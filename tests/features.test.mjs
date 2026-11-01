@@ -81,3 +81,29 @@ test('GitHub Pages workflow installs, tests, builds and deploys the dist artifac
   assert.match(viteConfig, /GITHUB_REPOSITORY/)
   assert.match(viteConfig, /repositoryName/)
 })
+
+test('the custom Persian date picker is used in both date-entry workflows', () => {
+  assert.match(app, /function PersianDatePicker\(/)
+  assert.match(app, /jalaaliMonthLength\(year, month\)/)
+  assert.match(app, /<PersianDatePicker label=\"تاریخ اتمام جلسه\"/)
+  assert.match(app, /<PersianDatePicker label=\"تاریخ عملکرد\"/)
+})
+
+test('goal targets are editable and drive real progress values', () => {
+  assert.match(app, /DEFAULT_STUDY_GOALS/)
+  assert.match(app, /onGoalChange\('weeklyHours'/)
+  assert.match(app, /onGoalChange\('monthlyHours'/)
+  assert.match(app, /studyGoals\.weeklyHours/)
+  assert.match(app, /studyGoals\.monthlyHours/)
+})
+
+test('the dashboard is gated by authentication and state hydration', () => {
+  assert.match(app, /if \(!cloudSession\) return <div className=\"auth-shell\"/)
+  assert.match(app, /cloudUserDataReady/)
+})
+
+test('glass styling and accessible date popover styling are present', () => {
+  assert.match(css, /backdrop-filter: blur/)
+  assert.match(css, /\.persian-date-popover/)
+  assert.match(css, /\.auth-card/)
+})

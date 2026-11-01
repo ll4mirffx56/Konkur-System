@@ -1,16 +1,17 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import * as XLSX from 'xlsx'
 import type { Session } from '@supabase/supabase-js'
-import { cloudConfigured, supabase, type MoroorCloudPayload } from './cloud'
-import { toGregorian, toJalaali } from 'jalaali-js'
+import { cloudConfigured, supabase } from './cloud'
+import { makeEmptyCloudPayload, mergeCloudPayloads, normalizeCloudPayload, saveCloudStateSafely, normalizePerformanceRecords, type CompleteCloudPayload } from './cloudSync'
+import { jalaaliMonthLength, toGregorian, toJalaali } from 'jalaali-js'
 import { addDaysISO, buildReviewSchedule, createLineChartGeometry, daysUntilISO, filterCommandItems, getPerformanceMetrics, isValidISODate, matchesReviewFilters, reorderPanels, type PanelKey } from './logic'
+import { DEFAULT_STUDY_GOALS, calculateExamPercentage, validateExamCounts, validateStudyGoals, type StudyGoalSettings, type ExamCounts } from './goalExam'
 import {
-  Activity, ArrowDownLeft, Bell, BookOpenCheck, CalendarDays, Check,
+  Activity, ArrowDownLeft, Bell, BookOpenCheck, CalendarDays, Check, ChevronLeft, ChevronRight,
   CircleCheck, CircleHelp, Clock3, Command, Download, FileSpreadsheet, Flame, GripVertical,
   LayoutDashboard, ListChecks, Moon, MoreHorizontal, MoveDown, MoveUp, Plus, RotateCcw,
   Search, Settings2, SlidersHorizontal, Sun, Target, TrendingUp, Upload, X, Zap, Trash2,
 } from 'lucide-react'
-import { DEFAULT_STUDY_GOALS, validateStudyGoals, type StudyGoalSettings } from './goalExam'
 
 type PageKey = 'dashboard' | 'reviews' | 'performance' | 'settings'
 type ReviewItem = {
@@ -29,6 +30,9 @@ const STORE = {
   panelOrder: 'moroor-panel-order-v3', reduceMotion: 'moroor-reduced-motion-v1', intervals: 'moroor-review-intervals-v1',
   studyGoals: 'moroor-study-goals-v1',
 }
+const LAST_CLOUD_USER_KEY = 'moroor-last-cloud-user-v1'
+const ACCOUNT_CACHE_PREFIX = 'moroor-account-cache-v1:'
+const SYNCED_CACHE_PREFIX = 'moroor-account-synced-v1:'
 const DEFAULT_INTERVALS = [1, 3, 7, 30, 90]
 const PANEL_ORDER: PanelKey[] = ['weekly', 'goal', 'reviews', 'quick']
 const NAV: { key: PageKey; label: string; icon: typeof LayoutDashboard }[] = [
@@ -99,10 +103,27 @@ function parseExcelDate(value: unknown): string | null {
   return jalaliToISO(text)
 }
 function validReviewArray(value: unknown): value is ReviewItem[] {
-  return Array.isArray(value) && value.every(item => item && typeof item.id === 'string' && typeof item.subject === 'string' && typeof item.title === 'string' && isValidISODate(item.dueDate) && isValidISODate(item.baseDate) && (item.doneAt == null || isValidISODate(item.doneAt)) && Number.isInteger(item.stageIndex) && Number.isInteger(item.interval))
+  if (!Array.isArray(value)) return false
+  const ids = new Set<string>()
+  return value.every(item => {
+    if (!item || typeof item.id !== 'string' || ids.has(item.id) || typeof item.subject !== 'string' || !item.subject.trim() || typeof item.title !== 'string' || !item.title.trim()) return false
+    const valid = isValidISODate(item.baseDate) && isValidISODate(item.dueDate) && item.dueDate === addDaysISO(item.baseDate, item.interval) && (item.doneAt == null || isValidISODate(item.doneAt)) && typeof item.done === 'boolean' && Number.isInteger(item.stageIndex) && item.stageIndex >= 0 && item.stageIndex < 5 && Number.isInteger(item.interval) && item.interval >= 1 && item.interval <= 365
+    if (valid) ids.add(item.id)
+    return valid
+  })
 }
-function validPerformanceArray(value: unknown): value is PerformanceRecord[] {
-  return Array.isArray(value) && value.every(item => item && typeof item.id === 'string' && isValidISODate(item.date) && [item.hours, item.planned, item.tests, item.correct, item.wrong, item.blank, item.focus].every(Number.isFinite))
+function validIntervals(value: unknown): value is number[] {
+  return Array.isArray(value) && value.length === DEFAULT_INTERVALS.length &&
+    value.every(item => Number.isInteger(item) && item > 0 && item <= 365) &&
+    new Set(value).size === value.length
+}
+
+function readPerformanceRecords(): PerformanceRecord[] {
+  return normalizePerformanceRecords(readStored<unknown>(STORE.performance, [])) ?? []
+}
+
+function formatJalaliDate(year: number, month: number, day: number): string {
+  return `${formatFa(year)}/${formatFa(month).padStart(2, '۰')}/${formatFa(day).padStart(2, '۰')}`
 }
 
 function App() {
@@ -115,16 +136,19 @@ function App() {
   const [cloudPassword, setCloudPassword] = useState('')
   const [cloudBusy, setCloudBusy] = useState(false)
   const [cloudReady, setCloudReady] = useState(false)
+  const [cloudHydrated, setCloudHydrated] = useState(false)
+  const [cloudHydratedUserId, setCloudHydratedUserId] = useState<string | null>(null)
+  const [cloudLoadError, setCloudLoadError] = useState('')
+  const [cloudRetry, setCloudRetry] = useState(0)
+  const lastSyncedPayloadRef = useRef<CompleteCloudPayload | null>(null)
+  const livePayloadRef = useRef<CompleteCloudPayload | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
   const [commandQuery, setCommandQuery] = useState('')
   const [commandIndex, setCommandIndex] = useState(0)
   const [reviewRecords, setReviewRecords] = useState<ReviewItem[]>(() => readStored<ReviewItem[]>(STORE.reviews, []))
-  const [performanceRecords, setPerformanceRecords] = useState<PerformanceRecord[]>(() => readStored<PerformanceRecord[]>(STORE.performance, []))
+  const [performanceRecords, setPerformanceRecords] = useState<PerformanceRecord[]>(readPerformanceRecords)
   const [intervals, setIntervals] = useState<number[]>(() => readStored<number[]>(STORE.intervals, DEFAULT_INTERVALS))
-  const [studyGoals, setStudyGoals] = useState<StudyGoalSettings>(() => {
-  const stored = readStored<unknown>(STORE.studyGoals, DEFAULT_STUDY_GOALS)
-  return validateStudyGoals(stored) ? stored : DEFAULT_STUDY_GOALS
-})
+  const [studyGoals, setStudyGoals] = useState<StudyGoalSettings>(() => { const stored = readStored<unknown>(STORE.studyGoals, DEFAULT_STUDY_GOALS); return validateStudyGoals(stored) ? stored : DEFAULT_STUDY_GOALS })
   const [panelOrder, setPanelOrder] = useState<PanelKey[]>(() => {
     const stored = readStored<PanelKey[]>(STORE.panelOrder, PANEL_ORDER)
     const valid = stored.filter(key => PANEL_ORDER.includes(key))
@@ -165,6 +189,11 @@ function App() {
   }, [performanceRecords, chartRange, today])
   const chartPoints: PerformancePoint[] = selectedPerformance.map(item => ({ ...item, day: isoToJalali(item.date, true) }))
   const currentMetrics = getPerformanceMetrics(chartPoints)
+  const validExamRecords = chartPoints.filter(item => Number.isInteger(item.tests) && item.tests > 0 && [item.correct, item.wrong, item.blank].every(value => Number.isInteger(value) && value >= 0) && item.correct + item.wrong + item.blank === item.tests)
+  const examCounts: ExamCounts = { total: validExamRecords.reduce((sum, item) => sum + item.tests, 0), correct: validExamRecords.reduce((sum, item) => sum + item.correct, 0), wrong: validExamRecords.reduce((sum, item) => sum + item.wrong, 0), blank: validExamRecords.reduce((sum, item) => sum + item.blank, 0) }
+  const examPercentage = examCounts.total > 0 ? calculateExamPercentage(examCounts) : 0
+  const cloudUserDataReady = Boolean(cloudSession?.user.id && cloudHydrated && cloudHydratedUserId === cloudSession.user.id)
+  livePayloadRef.current = { version: 1, reviews: reviewRecords, performance: performanceRecords, intervals, theme, panelOrder, reduceMotion, studyGoals }
   const subjects = Array.from(new Set(reviews.map(item => item.subject)))
 
   useEffect(() => {
@@ -183,17 +212,151 @@ function App() {
   useEffect(() => {
     if (!supabase) { setCloudReady(true); return }
     let alive = true
-    supabase.auth.getSession().then(({ data }) => { if (alive) { setCloudSession(data.session); setCloudReady(true) } })
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => { setCloudSession(session); setCloudReady(true) })
+    const initializeSession = async () => {
+      try {
+        const { data, error } = await supabase.auth.getSession()
+        if (error) throw error
+        if (alive) { setCloudSession(data.session); setCloudReady(true) }
+      } catch (error) {
+        if (alive) {
+          setCloudLoadError(error instanceof Error ? error.message : 'بررسی نشست کاربری ناموفق بود.')
+          setCloudReady(true)
+        }
+      }
+    }
+    void initializeSession()
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setCloudSession(session)
+      setCloudReady(true)
+    })
     return () => { alive = false; listener.subscription.unsubscribe() }
   }, [])
+
+  useEffect(() => {
+    const userId = cloudSession?.user.id
+    if (!supabase || !userId) {
+      setCloudHydrated(false)
+      setCloudHydratedUserId(null)
+      setCloudLoadError('')
+      lastSyncedPayloadRef.current = null
+      livePayloadRef.current = null
+      return
+    }
+
+    let alive = true
+    setCloudHydrated(false)
+    setCloudHydratedUserId(null)
+    setCloudLoadError('')
+    lastSyncedPayloadRef.current = null
+    livePayloadRef.current = null
+
+    const channel = supabase.channel(`moroor-state-${userId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'user_app_state', filter: `user_id=eq.${userId}` }, payload => {
+        if (!alive || !lastSyncedPayloadRef.current) return
+        const row = payload.new as { payload?: unknown; updated_at?: string } | null
+        if (!row?.payload || !row.updated_at) return
+        const incoming = normalizeCloudPayload(row.payload)
+        if (!incoming) return
+        const base = lastSyncedPayloadRef.current
+        const local = livePayloadRef.current ?? base
+        const merged = mergeCloudPayloads(base, local, incoming)
+        lastSyncedPayloadRef.current = incoming
+        if (JSON.stringify(merged) !== JSON.stringify(local)) applyCloudPayload(merged, false)
+      }).subscribe()
+
+    const hydrate = async () => {
+      try {
+        const { data: row, error } = await supabase.from('user_app_state')
+          .select('payload, updated_at')
+          .eq('user_id', userId)
+          .maybeSingle()
+        if (error) throw error
+        if (!alive) return
+
+        const remote = row ? normalizeCloudPayload(row.payload) : null
+        if (row && !remote) throw new Error('ساختار اطلاعات ابری معتبر نیست؛ برای جلوگیری از جایگزینی ناخواستهٔ داده‌ها، ورود به داشبورد متوقف شد.')
+        let previousUserId: string | null = null
+        let cached: CompleteCloudPayload | null = null
+        let previouslySynced: CompleteCloudPayload | null = null
+        try {
+          previousUserId = localStorage.getItem(LAST_CLOUD_USER_KEY)
+          cached = normalizeCloudPayload(JSON.parse(localStorage.getItem(`${ACCOUNT_CACHE_PREFIX}${userId}`) ?? 'null'))
+          previouslySynced = normalizeCloudPayload(JSON.parse(localStorage.getItem(`${SYNCED_CACHE_PREFIX}${userId}`) ?? 'null'))
+        } catch { /* browser storage may be disabled; cloud remains the source of truth */ }
+
+        let initial: CompleteCloudPayload
+        if (remote) {
+          // Preserve only local edits made after the last confirmed sync.
+          initial = cached && previouslySynced && JSON.stringify(cached) !== JSON.stringify(previouslySynced)
+            ? mergeCloudPayloads(previouslySynced, cached, remote)
+            : remote
+        } else {
+          // First account on this device may adopt legacy local data. Switching accounts never copies
+          // the previous account's local data into a new account.
+          initial = cached ?? (previousUserId && previousUserId !== userId ? makeEmptyCloudPayload() : currentCloudPayload())
+        }
+
+        const baseline = remote ?? makeEmptyCloudPayload()
+        const saved = await saveCloudStateSafely(supabase, userId, initial, baseline)
+        if (!alive) return
+        applyCloudPayload(saved.payload, true)
+        lastSyncedPayloadRef.current = saved.payload
+        writeSyncedPayload(userId, saved.payload)
+        try {
+          localStorage.setItem(LAST_CLOUD_USER_KEY, userId)
+          localStorage.setItem(`${ACCOUNT_CACHE_PREFIX}${userId}`, JSON.stringify(saved.payload))
+        } catch { /* cloud remains the source of truth */ }
+
+        setCloudHydrated(true)
+        setCloudHydratedUserId(userId)
+      } catch (error) {
+        if (alive) setCloudLoadError(error instanceof Error ? error.message : 'خطا در بارگذاری اطلاعات ابری')
+      }
+    }
+    void hydrate()
+    return () => { alive = false; void supabase?.removeChannel(channel) }
+  }, [cloudSession?.user.id, cloudRetry])
   useEffect(() => { document.documentElement.dataset.theme = theme; try { localStorage.setItem(STORE.theme, theme) } catch { /* storage unavailable */ } }, [theme])
   useEffect(() => { document.documentElement.dataset.reduceMotion = reduceMotion ? 'true' : 'false'; try { localStorage.setItem(STORE.reduceMotion, String(reduceMotion)) } catch { /* storage unavailable */ } }, [reduceMotion])
   useEffect(() => { try { localStorage.setItem(STORE.reviews, JSON.stringify(reviewRecords)) } catch { setNotice('فضای ذخیره‌سازی مرورگر در دسترس نیست؛ از پشتیبان‌گیری استفاده کن.') } }, [reviewRecords])
   useEffect(() => { try { localStorage.setItem(STORE.performance, JSON.stringify(performanceRecords)) } catch { setNotice('فضای ذخیره‌سازی مرورگر در دسترس نیست؛ از پشتیبان‌گیری استفاده کن.') } }, [performanceRecords])
   useEffect(() => { try { localStorage.setItem(STORE.panelOrder, JSON.stringify(panelOrder)) } catch { /* layout still works in this session */ } }, [panelOrder])
   useEffect(() => { try { localStorage.setItem(STORE.intervals, JSON.stringify(intervals)) } catch { /* settings still work in this session */ } }, [intervals])
-  useEffect(() => { try { localStorage.setItem(STORE.studyGoals, JSON.stringify(studyGoals)) } catch { setNotice('ذخیرهٔ هدف‌ها انجام نشد.') } }, [studyGoals])
+  useEffect(() => { try { localStorage.setItem(STORE.studyGoals, JSON.stringify(studyGoals)) } catch { setNotice('ذخیرهٔ هدف‌های مطالعه انجام نشد.') } }, [studyGoals])
+  useEffect(() => {
+    const userId = cloudSession?.user.id
+    if (!supabase || !userId || !cloudHydrated || cloudHydratedUserId !== userId) return
+    const snapshot = currentCloudPayload()
+    const baseline = lastSyncedPayloadRef.current
+    if (baseline && JSON.stringify(snapshot) === JSON.stringify(baseline)) return
+
+    const timeout = window.setTimeout(() => {
+      const freshest = livePayloadRef.current ?? snapshot
+      const baseAtExecution = lastSyncedPayloadRef.current ?? makeEmptyCloudPayload()
+      void (async () => {
+        try {
+          const saved = await saveCloudStateSafely(supabase, userId, freshest, baseAtExecution)
+          lastSyncedPayloadRef.current = saved.payload
+          writeSyncedPayload(userId, saved.payload)
+          try { localStorage.setItem(`${ACCOUNT_CACHE_PREFIX}${userId}`, JSON.stringify(saved.payload)) } catch { /* cloud copy remains authoritative */ }
+
+          // Apply merged remote edits only when the user has not made a newer local edit
+          // while the network request was in flight.
+          const currentLive = livePayloadRef.current
+          if (currentLive && JSON.stringify(currentLive) === JSON.stringify(freshest) && JSON.stringify(saved.payload) !== JSON.stringify(currentLive)) {
+            applyCloudPayload(saved.payload, false)
+          }
+        } catch (error) {
+          setNotice(error instanceof Error ? `همگام‌سازی خودکار ناموفق بود: ${error.message}` : 'همگام‌سازی خودکار ناموفق بود.')
+        }
+      })()
+    }, 650)
+    return () => window.clearTimeout(timeout)
+  }, [cloudSession?.user.id, cloudHydrated, cloudHydratedUserId, reviewRecords, performanceRecords, intervals, theme, panelOrder, reduceMotion, studyGoals])
+  useEffect(() => {
+    if (!cloudSession?.user.id || !cloudHydrated || cloudHydratedUserId !== cloudSession.user.id) return
+    try { localStorage.setItem(`${ACCOUNT_CACHE_PREFIX}${cloudSession.user.id}`, JSON.stringify(currentCloudPayload())) } catch { /* local cache is optional */ }
+  }, [cloudSession?.user.id, cloudHydrated, cloudHydratedUserId, reviewRecords, performanceRecords, intervals, theme, panelOrder, reduceMotion, studyGoals])
   useEffect(() => {
     if (!searchOpen) return
     setCommandQuery(''); setCommandIndex(0); window.setTimeout(() => commandInputRef.current?.focus(), 0)
@@ -219,19 +382,6 @@ function App() {
   function toggleReview(id: string) {
     setReviewRecords(current => current.map(item => item.id === id ? { ...item, done: !item.done, doneAt: item.done ? null : today } : item))
   }
-  function updateStudyGoal(key: keyof StudyGoalSettings, rawValue: string) {
-  if (rawValue.trim() === '') return
-
-  const value = Number(rawValue)
-  const max = key === 'weeklyHours' ? 168 : 744
-
-  if (!Number.isFinite(value) || value < 0 || value > max) {
-    setNotice(`هدف ${key === 'weeklyHours' ? 'هفتگی' : 'ماهانه'} باید بین ۰ و ${max} ساعت باشد.`)
-    return
-  }
-
-  setStudyGoals(current => ({ ...current, [key]: value }))
-}
   function deleteReview(id: string) {
     const item = reviewRecords.find(review => review.id === id)
     if (!item || !window.confirm(`«${item.title} · ${item.stage}» حذف شود؟`)) return
@@ -260,10 +410,16 @@ function App() {
     const parsedPerformanceDate = jalaliToISO(performanceDateText)
     if (!parsedPerformanceDate) { setNotice('تاریخ جلالی معتبر وارد کن؛ قالب نمونه ۱۴۰۵/۰۸/۰۵ است.'); return }
     if (focus > 10 || !Number.isInteger(focus) || hours > 24 || planned > 24 || !Number.isInteger(tests) || !Number.isInteger(correct) || !Number.isInteger(wrong) || !Number.isInteger(blank)) { setNotice('تمرکز باید بین ۰ تا ۱۰ و تعداد تست‌ها عدد صحیح باشد.'); return }
-    if (correct + wrong + blank > tests) { setNotice('مجموع صحیح، غلط و نزده نباید از تعداد کل تست‌ها بیشتر شود.'); return }
+    let examPercent: number | null = null
+    if (tests === 0) {
+      if (correct !== 0 || wrong !== 0 || blank !== 0) { setNotice('اگر کل تست‌ها صفر است، تعداد صحیح، غلط و نزده نیز باید صفر باشد.'); return }
+    } else {
+      try { validateExamCounts({ total: tests, correct, wrong, blank }) } catch { setNotice('مجموع پاسخ‌های صحیح، غلط و نزده باید دقیقاً برابر کل تست‌ها باشد.'); return }
+      examPercent = calculateExamPercentage({ total: tests, correct, wrong, blank })
+    }
     const entry: PerformanceRecord = { id: `p-${parsedPerformanceDate}`, date: parsedPerformanceDate, hours, planned, tests, correct, wrong, blank, focus }
     setPerformanceRecords(current => [...current.filter(item => item.date !== parsedPerformanceDate), entry].sort((a, b) => a.date.localeCompare(b.date)))
-    setShowPerformanceForm(false); setNotice('عملکرد روز ذخیره شد.')
+    setShowPerformanceForm(false); setNotice(examPercent === null ? 'عملکرد ذخیره شد؛ امروز تستی ثبت نشده است.' : `عملکرد ذخیره شد؛ درصد آزمون با نمرهٔ منفی: ${formatFa(Math.round(examPercent * 10) / 10)}٪`)
   }
   async function cloudSignIn(event: FormEvent) {
     event.preventDefault()
@@ -274,7 +430,7 @@ function App() {
       const { error } = await supabase.auth.signInWithPassword({ email: cloudEmail.trim(), password: cloudPassword })
       if (error) throw error
       setCloudPassword('')
-      setNotice('ورود موفق بود. برای انتقال اطلاعات، «ارسال اطلاعات به ابر» را جداگانه اجرا کن.')
+      setNotice('ورود موفق بود؛ اطلاعات حساب در حال بارگذاری و همگام‌سازی است.')
     } catch (error) { setNotice(error instanceof Error ? `ورود ناموفق بود: ${error.message}` : 'ورود ناموفق بود.') }
     finally { setCloudBusy(false) }
   }
@@ -286,27 +442,49 @@ function App() {
       const { data, error } = await supabase.auth.signUp({ email: cloudEmail.trim(), password: cloudPassword })
       if (error) throw error
       if (!data.session) setNotice('حساب ساخته شد. ایمیلت را برای تأیید بررسی کن؛ سپس وارد شو.')
-      else setNotice('حساب ساخته شد و وارد شدی. حالا می‌توانی اطلاعات را به ابر بفرستی.')
+      else setNotice('حساب ساخته شد و وارد شدی؛ اطلاعات حساب در حال آماده‌سازی است.')
       setCloudPassword('')
     } catch (error) { setNotice(error instanceof Error ? `ساخت حساب ناموفق بود: ${error.message}` : 'ساخت حساب ناموفق بود.') }
     finally { setCloudBusy(false) }
   }
   async function cloudSignOut() {
     if (!supabase) return
+    if (cloudSession?.user.id) { try { localStorage.setItem(`${ACCOUNT_CACHE_PREFIX}${cloudSession.user.id}`, JSON.stringify(currentCloudPayload())) } catch { /* optional cache */ } }
     const { error } = await supabase.auth.signOut()
     setNotice(error ? `خروج ناموفق بود: ${error.message}` : 'از حساب ابری خارج شدی. اطلاعات محلی این دستگاه دست‌نخورده ماند.')
   }
-  function currentCloudPayload(): MoroorCloudPayload {
+  function currentCloudPayload(): CompleteCloudPayload {
     return { version: 1, reviews: reviewRecords, performance: performanceRecords, intervals, theme, panelOrder, reduceMotion, studyGoals }
+  }
+  function writeSyncedPayload(userId: string, payload: CompleteCloudPayload) {
+    try { localStorage.setItem(`${SYNCED_CACHE_PREFIX}${userId}`, JSON.stringify(payload)) } catch { /* synced cache is optional */ }
+  }
+  function applyCloudPayload(payload: CompleteCloudPayload, markSynced: boolean) {
+    setReviewRecords(payload.reviews as ReviewItem[])
+    setPerformanceRecords(payload.performance as PerformanceRecord[])
+    setIntervals(payload.intervals)
+    setTheme(payload.theme)
+    setPanelOrder(payload.panelOrder as PanelKey[])
+    setReduceMotion(payload.reduceMotion)
+    setStudyGoals(payload.studyGoals)
+    livePayloadRef.current = payload
+    if (markSynced) lastSyncedPayloadRef.current = payload
+    const userId = cloudSession?.user.id
+    if (userId) { try { localStorage.setItem(`${ACCOUNT_CACHE_PREFIX}${userId}`, JSON.stringify(payload)) } catch { /* optional cache */ } }
   }
   async function uploadCloudState() {
     if (!supabase || !cloudSession?.user) { setNotice('برای همگام‌سازی ابتدا وارد حساب ابری شو.'); return }
-    if (!window.confirm('اطلاعات فعلی همین دستگاه در فضای ابری ذخیره و جایگزین نسخهٔ ابری قبلی می‌شود. ادامه می‌دهی؟')) return
+    if (!window.confirm('اطلاعات این دستگاه با تغییرات نسخهٔ ابری ادغام و ذخیره می‌شود؛ رکوردهای مستقل هر دو دستگاه حفظ می‌شوند. ادامه می‌دهی؟')) return
     setCloudBusy(true)
+    const payload = currentCloudPayload()
     try {
-      const { error } = await supabase.from('user_app_state').upsert({ user_id: cloudSession.user.id, payload: currentCloudPayload(), updated_at: new Date().toISOString() })
-      if (error) throw error
-      setNotice('اطلاعات فعلی این دستگاه در فضای ابری ذخیره شد.')
+      const baseline = lastSyncedPayloadRef.current ?? makeEmptyCloudPayload()
+      const saved = await saveCloudStateSafely(supabase, cloudSession.user.id, payload, baseline)
+      lastSyncedPayloadRef.current = saved.payload
+      writeSyncedPayload(cloudSession.user.id, saved.payload)
+      try { localStorage.setItem(`${ACCOUNT_CACHE_PREFIX}${cloudSession.user.id}`, JSON.stringify(saved.payload)) } catch { /* optional cache */ }
+      if (JSON.stringify(livePayloadRef.current) === JSON.stringify(payload) && JSON.stringify(saved.payload) !== JSON.stringify(payload)) applyCloudPayload(saved.payload, false)
+      setNotice('اطلاعات این دستگاه با نسخهٔ ابری ادغام و ذخیره شد.')
     } catch (error) { setNotice(error instanceof Error ? `ذخیرهٔ ابری ناموفق بود: ${error.message}` : 'ذخیرهٔ ابری ناموفق بود.') }
     finally { setCloudBusy(false) }
   }
@@ -315,16 +493,13 @@ function App() {
     if (!window.confirm('اطلاعات محلی این دستگاه با نسخهٔ ابری جایگزین می‌شود. قبل از ادامه از اطلاعات فعلی پشتیبان بگیر. ادامه می‌دهی؟')) return
     setCloudBusy(true)
     try {
-      const { data, error } = await supabase.from('user_app_state').select('payload').eq('user_id', cloudSession.user.id).maybeSingle()
+      const { data, error } = await supabase.from('user_app_state').select('payload, updated_at').eq('user_id', cloudSession.user.id).maybeSingle()
       if (error) throw error
-      const payload = data?.payload as Partial<MoroorCloudPayload> | undefined
-      if (!payload || payload.version !== 1 || !validReviewArray(payload.reviews) || !validPerformanceArray(payload.performance)) throw new Error('نسخهٔ ابری وجود ندارد یا ساختار آن معتبر نیست؛ ابتدا از دستگاهی که اطلاعات دارد، ارسال اطلاعات به ابر را اجرا کن.')
-      setReviewRecords(payload.reviews); setPerformanceRecords(payload.performance)
-      if (Array.isArray(payload.intervals) && payload.intervals.length === 5 && payload.intervals.every(v => Number.isInteger(v) && v > 0 && v <= 365) && new Set(payload.intervals).size === 5) setIntervals(payload.intervals)
-      if (payload.theme === 'dark' || payload.theme === 'light') setTheme(payload.theme)
-      if (Array.isArray(payload.panelOrder) && payload.panelOrder.length === PANEL_ORDER.length && payload.panelOrder.every(v => PANEL_ORDER.includes(v as PanelKey)) && new Set(payload.panelOrder).size === PANEL_ORDER.length) setPanelOrder(payload.panelOrder as PanelKey[])
-      if (typeof payload.reduceMotion === 'boolean') setReduceMotion(payload.reduceMotion)
-      if (validateStudyGoals(payload.studyGoals)) setStudyGoals(payload.studyGoals)
+      const payload = normalizeCloudPayload(data?.payload)
+      if (!payload || !data?.updated_at) throw new Error('نسخهٔ ابری وجود ندارد یا ساختار آن معتبر نیست؛ ابتدا اطلاعات معتبر وارد کن.')
+      applyCloudPayload(payload, true)
+      lastSyncedPayloadRef.current = payload
+      writeSyncedPayload(cloudSession.user.id, payload)
       setNotice('اطلاعات ابری روی این دستگاه بازیابی شد.')
     } catch (error) { setNotice(error instanceof Error ? `بازیابی ابری ناموفق بود: ${error.message}` : 'بازیابی ابری ناموفق بود.') }
     finally { setCloudBusy(false) }
@@ -346,15 +521,9 @@ function App() {
       const statuses = stages.map(item => item?.done ? 'انجام شد' : 'انجام نشده')
       reviewRows.push([first.subject, first.title, isoToJalali(first.baseDate), ...dates, stages.every(item => item?.done) ? 'تکمیل‌شده' : 'در جریان', ...statuses])
     })
-    const perfRows: (string | number)[][] = [['گزارش عملکرد مطالعه'], [], ['تاریخ', 'ساعت مطالعه', 'ساعت برنامه', 'تعداد تست', 'صحیح', 'غلط', 'نزده', 'تمرکز (۰ تا ۱۰)']]
-    performanceRecords.forEach(item => perfRows.push([isoToJalali(item.date), item.hours, item.planned, item.tests, item.correct, item.wrong, item.blank, item.focus]))
-    const settingsRows: (string | number)[][] = [
-  ['تنظیمات'], [],
-  ['سال', 1406],
-  ...intervals.map((value, index) => [`فاصله مرور ${index + 1}`, value]),
-  ['هدف ساعت هفتگی', studyGoals.weeklyHours],
-  ['هدف ساعت ماهانه', studyGoals.monthlyHours],
-]
+    const perfRows: (string | number)[][] = [['گزارش عملکرد مطالعه'], [], ['تاریخ', 'ساعت مطالعه', 'ساعت برنامه', 'تعداد تست', 'صحیح', 'غلط', 'نزده', 'تمرکز (۰ تا ۱۰)', 'درصد آزمون با نمرهٔ منفی']]
+    performanceRecords.forEach(item => perfRows.push([isoToJalali(item.date), item.hours, item.planned, item.tests, item.correct, item.wrong, item.blank, item.focus, item.tests > 0 ? Math.round(calculateExamPercentage({ total: item.tests, correct: item.correct, wrong: item.wrong, blank: item.blank }) * 10) / 10 : '']))
+    const settingsRows: (string | number)[][] = [['تنظیمات'], [], ['سال', 1406], ...intervals.map((value, index) => [`فاصله مرور ${index + 1}`, value]), ['هدف ساعت هفتگی', studyGoals.weeklyHours], ['هدف ساعت ماهانه', studyGoals.monthlyHours]]
     const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(reviewRows), 'مرور'); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(perfRows), 'عملکرد'); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(settingsRows), 'تنظیمات')
     XLSX.writeFile(wb, `moroor-export-${today}.xlsx`); setNotice('فایل اکسل خروجی ساخته شد.')
   }
@@ -363,9 +532,10 @@ function App() {
     reader.onload = () => {
       try {
         const payload = JSON.parse(String(reader.result)) as { reviews?: unknown; performance?: unknown; intervals?: unknown; theme?: unknown; panelOrder?: unknown; reduceMotion?: unknown; studyGoals?: unknown }
-        if (!validReviewArray(payload.reviews) || !validPerformanceArray(payload.performance)) throw new Error('invalid backup')
-        if (!window.confirm(`پشتیبان شامل ${formatFa(payload.reviews.length)} موعد مرور و ${formatFa(payload.performance.length)} رکورد عملکرد است. اطلاعات فعلی با آن جایگزین شود؟`)) return
-        setReviewRecords(payload.reviews); setPerformanceRecords(payload.performance)
+        const normalizedPerformance = normalizePerformanceRecords(payload.performance)
+        if (!validReviewArray(payload.reviews) || !normalizedPerformance) throw new Error('invalid backup')
+        if (!window.confirm(`پشتیبان شامل ${formatFa(payload.reviews.length)} موعد مرور و ${formatFa(normalizedPerformance.length)} رکورد عملکرد است. اطلاعات فعلی با آن جایگزین شود؟`)) return
+        setReviewRecords(payload.reviews); setPerformanceRecords(normalizedPerformance)
         if (Array.isArray(payload.intervals) && payload.intervals.length === 5 && payload.intervals.every(value => typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 365) && new Set(payload.intervals).size === 5) setIntervals(payload.intervals as number[])
         if (payload.theme === 'dark' || payload.theme === 'light') setTheme(payload.theme)
         if (Array.isArray(payload.panelOrder) && payload.panelOrder.every(value => typeof value === 'string' && PANEL_ORDER.includes(value as PanelKey)) && payload.panelOrder.length === PANEL_ORDER.length && new Set(payload.panelOrder).size === PANEL_ORDER.length) setPanelOrder(payload.panelOrder as PanelKey[])
@@ -386,7 +556,11 @@ function App() {
         const settingsSheet = wb.Sheets['تنظیمات']
         const settingsRows = settingsSheet ? XLSX.utils.sheet_to_json<unknown[]>(settingsSheet, { header: 1, raw: true, defval: '' }) : []
         let importedIntervals = DEFAULT_INTERVALS.map((fallback, index) => Number(settingsRows[index + 3]?.[1]) || fallback)
-        if (importedIntervals.some(value => !Number.isInteger(value) || value < 1 || value > 365) || new Set(importedIntervals).size !== importedIntervals.length) importedIntervals = DEFAULT_INTERVALS
+        if (!validIntervals(importedIntervals)) importedIntervals = DEFAULT_INTERVALS
+        const normalizedSettings = settingsRows.map(row => [toLatinDigits(String(row?.[0] ?? '')).trim(), row?.[1]])
+        const weeklyRow = normalizedSettings.find(row => row[0] === 'هدف ساعت هفتگی')
+        const monthlyRow = normalizedSettings.find(row => row[0] === 'هدف ساعت ماهانه')
+        const importedGoals = weeklyRow && monthlyRow ? { weeklyHours: Number(weeklyRow[1]), monthlyHours: Number(monthlyRow[1]) } : null
         const reviewSheet = wb.Sheets['مرور']
         if (reviewSheet) {
           const rows = XLSX.utils.sheet_to_json<unknown[]>(reviewSheet, { header: 1, raw: true, defval: '' })
@@ -416,8 +590,11 @@ function App() {
           })
         }
         if (!reviewSheet && !performanceSheet) throw new Error('missing sheets')
+        const normalizedPerformance = normalizePerformanceRecords(importedPerformance)
+        if (!normalizedPerformance) throw new Error('invalid performance rows')
         if (!window.confirm(`از اکسل ${formatFa(importedReviews.length / Math.max(1, importedIntervals.length))} موضوع مرور و ${formatFa(importedPerformance.length)} روز عملکرد استخراج شد. داده‌های فعلی جایگزین شوند؟ ردیف نمونهٔ مشخص‌شده در اکسل نادیده گرفته می‌شود.`)) return
-        setReviewRecords(importedReviews); setPerformanceRecords(importedPerformance); setIntervals(importedIntervals)
+        setReviewRecords(importedReviews); setPerformanceRecords(normalizedPerformance); setIntervals(importedIntervals)
+        if (importedGoals && validateStudyGoals(importedGoals)) setStudyGoals(importedGoals)
         setNotice('داده‌های اکسل وارد شدند؛ لطفاً چند ردیف را با فایل اصلی تطبیق بده.')
       } catch (error) { setNotice(`خواندن اکسل ناموفق بود: ${error instanceof Error ? error.message : 'ساختار فایل شناخته نشد'}`) }
     }
@@ -441,6 +618,13 @@ function App() {
       return { ...item, interval, stage: `مرور ${formatFa(interval)} روزه`, dueDate: addDaysISO(item.baseDate, interval) }
     }))
   }
+  function updateStudyGoal(key: keyof StudyGoalSettings, rawValue: string) {
+    if (rawValue.trim() === '') return
+    const value = Number(rawValue)
+    const max = key === 'weeklyHours' ? 168 : 744
+    if (!Number.isFinite(value) || value < 0 || value > max) { setNotice(`هدف ${key === 'weeklyHours' ? 'هفتگی' : 'ماهانه'} باید بین ۰ و ${max} ساعت باشد.`); return }
+    setStudyGoals(current => ({ ...current, [key]: value }))
+  }
   function movePanel(source: PanelKey, target: PanelKey) { if (source !== target) setPanelOrder(current => reorderPanels(current, source, target)) }
   function shiftPanel(key: PanelKey, step: -1 | 1) {
     setPanelOrder(current => { const index = current.indexOf(key); const target = index + step; if (target < 0 || target >= current.length) return current; const next = [...current]; [next[index], next[target]] = [next[target], next[index]]; return next })
@@ -453,27 +637,32 @@ function App() {
   const recentHours = chartPoints.reduce((sum, item) => sum + item.hours, 0)
   const subjectsForForm = ['شیمی', 'فیزیک', 'حسابان', 'هندسه', 'گسسته', ...subjects.filter(subject => !['شیمی', 'فیزیک', 'حسابان', 'هندسه', 'گسسته'].includes(subject))]
 
+  if (!cloudReady || (cloudSession && !cloudUserDataReady && !cloudLoadError)) return <div className="auth-shell"><div className="auth-card"><div className="auth-brand"><div className="brand-mark"><BookOpenCheck size={23} /></div><div><strong>مــرور</strong><span>STUDY OS</span></div></div><div className="auth-spinner" /><h1>در حال آماده‌سازی فضای شخصی</h1><p>در حال بارگذاری اطلاعات حساب و همگام‌سازی دستگاه‌ها…</p></div></div>
+  if (!supabase) return <div className="auth-shell"><div className="auth-card"><div className="auth-brand"><div className="brand-mark"><BookOpenCheck size={23} /></div><div><strong>مــرور</strong><span>STUDY OS</span></div></div><h1>اتصال حساب فعال نیست</h1><p>برای استفاده از سایت، ابتدا متغیرهای محیطی Supabase را در تنظیمات انتشار وارد کن.</p><div className="form-info"><CircleHelp size={17} /><span>مقادیر موردنیاز: VITE_SUPABASE_URL و VITE_SUPABASE_PUBLISHABLE_KEY. راهنما در فایل CLOUD-SETUP.md قرار دارد.</span></div></div></div>
+  if (cloudSession && cloudLoadError) return <div className="auth-shell"><div className="auth-card"><div className="auth-brand"><div className="brand-mark"><BookOpenCheck size={23} /></div><div><strong>مــرور</strong><span>STUDY OS</span></div></div><h1>بارگذاری اطلاعات ناموفق بود</h1><p>برای جلوگیری از جایگزینی ناخواستهٔ اطلاعات، داشبورد تا بازیابی امن داده‌ها باز نمی‌شود.</p><div className="form-info"><CircleHelp size={17} /><span>{cloudLoadError}</span></div><button className="primary-button auth-wide-button" onClick={() => setCloudRetry(value => value + 1)}>تلاش دوباره</button><button className="secondary-button auth-wide-button" onClick={cloudSignOut}>خروج از حساب</button></div></div>
+  if (!cloudSession) return <div className="auth-shell"><div className="auth-card"><div className="auth-brand"><div className="brand-mark"><BookOpenCheck size={23} /></div><div><strong>مــرور</strong><span>STUDY OS</span></div></div><div className="auth-eyebrow">فضای مطالعهٔ شخصی و همگام‌شده</div><h1>به فضای شخصی‌ات وارد شو</h1><p>برای دیدن و ذخیره‌شدن اطلاعات روی همهٔ دستگاه‌ها، ابتدا حساب بساز یا وارد شو.</p><form className="auth-form" onSubmit={cloudSignIn}><label className="form-field"><span>ایمیل</span><input type="email" autoComplete="email" value={cloudEmail} onChange={event => setCloudEmail(event.target.value)} required placeholder="you@example.com" /></label><label className="form-field"><span>رمز عبور</span><input type="password" autoComplete="current-password" minLength={6} value={cloudPassword} onChange={event => setCloudPassword(event.target.value)} required placeholder="حداقل ۶ نویسه" /></label><div className="auth-actions"><button type="button" className="secondary-button" disabled={cloudBusy} onClick={cloudSignUp}>{cloudBusy ? 'در حال انجام…' : 'ساخت حساب جدید'}</button><button className="primary-button" type="submit" disabled={cloudBusy}>{cloudBusy ? 'در حال ورود…' : 'ورود به حساب'}</button></div></form>{cloudLoadError && <div className="form-info auth-notice" role="status">{cloudLoadError}</div>}{notice && <div className="form-info auth-notice" role="status">{notice}</div>}{!cloudReady && <p>در حال بررسی نشست کاربری…</p>}<small>اطلاعات هر حساب جدا از حساب‌های دیگر نگه‌داری می‌شود.</small></div></div>
+
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><div className="brand-mark"><BookOpenCheck size={21} strokeWidth={2.3} /></div><div className="brand-copy"><strong>مــرور</strong><span>STUDY OS</span></div></div>
       <div className="workspace-label">فضای کاری</div>
       <nav className="main-nav" aria-label="ناوبری اصلی">{NAV.map(({ key, label, icon: Icon }) => <button key={key} className={`nav-item ${activePage === key ? 'active' : ''}`} onClick={() => setActivePage(key)}><Icon size={18} /><span>{label}</span>{key === 'reviews' && <span className="nav-count">{formatFa(todayReviews + overdueReviews)}</span>}</button>)}</nav>
-      <div className="sidebar-bottom"><div className="focus-card"><div className="focus-card-top"><span className="focus-icon"><Flame size={16} /></span><span>موعدهای باز</span></div><div className="focus-number">{formatFa(todayReviews + overdueReviews)} <small>مرور امروز و عقب‌افتاده</small></div><div className="streak-track"><span style={{ width: `${reviews.length ? Math.min(100, reviews.filter(item => item.done).length / reviews.length * 100) : 0}%` }} /></div><p>ثبت و پیگیری را از همین‌جا ادامه بده.</p></div><button className="help-link" onClick={() => setNotice('تاریخ‌ها با ساعت محلی دستگاه محاسبه و به تقویم جلالی نمایش داده می‌شوند.')}><CircleHelp size={17} /> راهنمای تاریخ‌ها</button><div className="profile"><div className="avatar">م</div><div className="profile-info"><strong>فضای شخصی</strong><span>{cloudSession ? 'حساب ابری متصل' : 'ذخیرهٔ محلی در مرورگر'}</span></div><MoreHorizontal size={19} className="muted-icon" /></div></div>
+      <div className="sidebar-bottom"><div className="focus-card"><div className="focus-card-top"><span className="focus-icon"><Flame size={16} /></span><span>موعدهای باز</span></div><div className="focus-number">{formatFa(todayReviews + overdueReviews)} <small>مرور امروز و عقب‌افتاده</small></div><div className="streak-track"><span style={{ width: `${reviews.length ? Math.min(100, reviews.filter(item => item.done).length / reviews.length * 100) : 0}%` }} /></div><p>ثبت و پیگیری را از همین‌جا ادامه بده.</p></div><button className="help-link" onClick={() => setNotice('تاریخ امروز هنگام اتصال از زمان پاسخ سایت با منطقهٔ زمانی تهران گرفته می‌شود؛ در حالت آفلاین ساعت دستگاه استفاده می‌شود.')}><CircleHelp size={17} /> راهنمای تاریخ‌ها</button><div className="profile"><div className="avatar">م</div><div className="profile-info"><strong>فضای شخصی</strong><span>{cloudSession ? 'حساب ابری متصل' : 'ذخیرهٔ محلی در مرورگر'}</span></div><MoreHorizontal size={19} className="muted-icon" /></div></div>
     </aside>
 
     <main className="main-content">
       <header className="topbar"><div className="breadcrumb"><span>فضای کاری</span><span className="crumb-slash">/</span><strong>{pageTitle}</strong></div><div className="topbar-actions"><button className="search-trigger" onClick={() => setSearchOpen(true)} aria-label="جست‌وجو و فرمان"><Search size={17} /><span>جست‌وجو یا اجرای فرمان...</span><kbd><Command size={11} /> K</kbd></button><button className="icon-button" aria-label="اعلان‌ها" onClick={() => setNotice(`${formatFa(todayReviews)} مرور امروز و ${formatFa(overdueReviews)} مرور عقب‌افتاده داری.`)}><Bell size={18} /><i /></button><span className="topbar-divider" /><button className="theme-toggle" onClick={() => setTheme(value => value === 'dark' ? 'light' : 'dark')} aria-label="تغییر تم">{theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}<span>{theme === 'dark' ? 'حالت روشن' : 'حالت تیره'}</span></button></div></header>
 
       {activePage === 'dashboard' && <div className="page-wrap page-enter">
-        <section className="welcome-row"><div><div className="eyebrow"><span className="status-dot" /> امروز، {isoToJalali(today)} <span className="live-pill">تاریخ دستگاه</span></div><h1>نمای کلی <span>مطالعه‌ات</span></h1><p className="page-subtitle">خلاصهٔ واقعی داده‌هایی که ثبت کرده‌ای؛ هر تغییری خودکار ذخیره می‌شود.</p></div><button className="primary-button" onClick={openNewPerformance}><Plus size={17} /> ثبت عملکرد</button></section>
-        <section className="stats-grid" aria-label="شاخص‌های کلیدی"><StatCard title="مرورهای امروز" value={formatFa(todayReviews)} suffix="مورد" delta="موعد مرور امروز" icon={CalendarDays} color="violet" progress={reviews.length ? todayReviews / reviews.length * 100 : 0} /><StatCard title="مرورهای عقب‌افتاده" value={formatFa(overdueReviews)} suffix="مورد" delta="نیازمند رسیدگی" icon={Clock3} color="amber" progress={reviews.length ? overdueReviews / reviews.length * 100 : 0} /><StatCard title={`ساعت مطالعهٔ ${chartRange === 7 ? 'هفته' : 'ماه'}`} value={formatFa(recentHours)} suffix="ساعت" delta={`${formatFa(chartPoints.length)} روز ثبت‌شده`} icon={Activity} color="blue" progress={Math.min(100, recentHours / (chartRange === 7 ? 35 : 150) * 100)} /><StatCard title="اجرای برنامه" value={formatFa(Math.round(currentMetrics.planExecution))} suffix="٪" delta="ساعت واقعی ÷ ساعت برنامه" icon={Target} color="green" progress={currentMetrics.planExecution} /></section>
+        <section className="welcome-row"><div><div className="eyebrow"><span className="status-dot" /> امروز، {isoToJalali(today)} <span className="live-pill">تاریخ امروز</span></div><h1>نمای کلی <span>مطالعه‌ات</span></h1><p className="page-subtitle">خلاصهٔ واقعی داده‌هایی که ثبت کرده‌ای؛ هر تغییری خودکار ذخیره می‌شود.</p></div><button className="primary-button" onClick={openNewPerformance}><Plus size={17} /> ثبت عملکرد</button></section>
+        <section className="stats-grid" aria-label="شاخص‌های کلیدی"><StatCard title="مرورهای امروز" value={formatFa(todayReviews)} suffix="مورد" delta="موعد مرور امروز" icon={CalendarDays} color="violet" progress={reviews.length ? todayReviews / reviews.length * 100 : 0} /><StatCard title="مرورهای عقب‌افتاده" value={formatFa(overdueReviews)} suffix="مورد" delta="نیازمند رسیدگی" icon={Clock3} color="amber" progress={reviews.length ? overdueReviews / reviews.length * 100 : 0} /><StatCard title={`ساعت مطالعهٔ ${chartRange === 7 ? 'هفته' : 'ماه'}`} value={formatFa(recentHours)} suffix="ساعت" delta={`${formatFa(chartPoints.length)} روز ثبت‌شده`} icon={Activity} color="blue" progress={(chartRange === 7 ? studyGoals.weeklyHours : studyGoals.monthlyHours) > 0 ? Math.min(100, recentHours / (chartRange === 7 ? studyGoals.weeklyHours : studyGoals.monthlyHours) * 100) : (recentHours > 0 ? 100 : 0)} /><StatCard title="اجرای برنامه" value={formatFa(Math.round(currentMetrics.planExecution))} suffix="٪" delta="ساعت واقعی ÷ ساعت برنامه" icon={Target} color="green" progress={currentMetrics.planExecution} /></section>
         <section className="dashboard-grid" aria-label="کارت‌های داشبورد" onDragEnd={() => { setDraggingPanel(null); setDropTarget(null) }}>{panelOrder.map(key => <div key={key} className={`dashboard-card-wrap ${dropTarget === key ? 'drop-target' : ''} ${draggingPanel === key ? 'is-dragging' : ''}`} onDragOver={event => { event.preventDefault(); if (draggingPanel && draggingPanel !== key) setDropTarget(key) }} onDrop={event => { event.preventDefault(); const source = event.dataTransfer?.getData('text/plain') as PanelKey | undefined; if (source && PANEL_ORDER.includes(source)) movePanel(source, key); setDraggingPanel(null); setDropTarget(null) }}>
           {key === 'weekly' && <WeeklyPanel points={chartPoints} range={chartRange} onRangeChange={setChartRange} onMoveUp={() => shiftPanel(key, -1)} onMoveDown={() => shiftPanel(key, 1)} onDragStart={() => setDraggingPanel(key)} onDragEnd={() => setDraggingPanel(null)} />}
-          {key === 'goal' && <GoalPanel points={chartPoints} range={chartRange} onMoveUp={() => shiftPanel(key, -1)} onMoveDown={() => shiftPanel(key, 1)} onDragStart={() => setDraggingPanel(key)} onDragEnd={() => setDraggingPanel(null)} />}
+          {key === 'goal' && <GoalPanel points={chartPoints} range={chartRange} goals={studyGoals} onGoalChange={updateStudyGoal} onMoveUp={() => shiftPanel(key, -1)} onMoveDown={() => shiftPanel(key, 1)} onDragStart={() => setDraggingPanel(key)} onDragEnd={() => setDraggingPanel(null)} />}
           {key === 'reviews' && <ReviewsPanel reviews={reviews} today={today} onToggle={toggleReview} onViewAll={() => setActivePage('reviews')} onAdd={openNewReview} onMoveUp={() => shiftPanel(key, -1)} onMoveDown={() => shiftPanel(key, 1)} onDragStart={() => setDraggingPanel(key)} onDragEnd={() => setDraggingPanel(null)} />}
           {key === 'quick' && <QuickPanel onNavigate={setActivePage} onAddReview={() => { setActivePage('reviews'); openNewReview() }} onAddPerformance={() => { setActivePage('performance'); openNewPerformance() }} onMoveUp={() => shiftPanel(key, -1)} onMoveDown={() => shiftPanel(key, 1)} onDragStart={() => setDraggingPanel(key)} onDragEnd={() => setDraggingPanel(null)} />}
         </div>)}</section>
-        <footer className="page-footer"><span>مرور · موتور محاسبات فعال</span><span><i className="footer-status" /> ذخیرهٔ محلی فعال است</span></footer>
+        <footer className="page-footer"><span>مرور · موتور محاسبات فعال</span><span><i className="footer-status" /> ذخیرهٔ محلی و همگام‌سازی حساب فعال است</span></footer>
       </div>}
 
       {activePage === 'reviews' && <div className="page-wrap page-enter">
@@ -488,16 +677,17 @@ function App() {
 
       {activePage === 'performance' && <div className="page-wrap page-enter">
         <section className="welcome-row"><div><div className="eyebrow"><span className="status-dot" /> گزارش و تحلیل <span className="live-pill">داده‌های ثبت‌شده</span></div><h1>عملکرد <span>مطالعه</span></h1><p className="page-subtitle">ساعت مطالعه، تست‌ها، دقت پاسخ‌گویی و اجرای برنامه از رکوردهای خودت.</p></div><div className="welcome-actions"><div className="range-switch" role="group" aria-label="بازهٔ نمودار"><button className={chartRange === 7 ? 'selected' : ''} onClick={() => setChartRange(7)}>۷ روز</button><button className={chartRange === 30 ? 'selected' : ''} onClick={() => setChartRange(30)}>۳۰ روز</button></div><button className="primary-button" onClick={openNewPerformance}><Plus size={16} /> ثبت روز</button></div></section>
-        <section className="stats-grid performance-stats"><StatCard title="مجموع ساعت مطالعه" value={formatFa(currentMetrics.hours)} suffix="ساعت" delta={`${formatFa(selectedPerformance.length)} روز ثبت‌شده`} icon={Clock3} color="blue" progress={Math.min(100, currentMetrics.hours / (chartRange === 7 ? 35 : 150) * 100)} /><StatCard title="مجموع تست‌ها" value={formatFa(currentMetrics.tests)} suffix="تست" delta="تعداد کل ثبت‌شده" icon={Target} color="violet" progress={Math.min(100, currentMetrics.tests / (chartRange === 7 ? 250 : 1500) * 100)} /><StatCard title="میانگین روز ثبت‌شده" value={formatFa(currentMetrics.averageHours)} suffix="ساعت" delta="فقط روزهای دارای رکورد" icon={TrendingUp} color="green" progress={Math.min(100, currentMetrics.averageHours / 8 * 100)} /><StatCard title="درصد پاسخ صحیح" value={formatFa(Math.round(currentMetrics.accuracy))} suffix="٪" delta="صحیح ÷ کل تست‌ها" icon={CircleCheck} color="amber" progress={currentMetrics.accuracy} /><StatCard title="اجرای برنامه" value={`${formatFa(Math.round(currentMetrics.planExecution))}`} suffix="٪" delta="میانگین ساعت واقعی ÷ برنامه" icon={Target} color="violet" progress={currentMetrics.planExecution} /><StatCard title="میانگین تمرکز" value={formatFa(currentMetrics.averageFocus)} suffix="/۱۰" delta="میانگین روزهای ثبت‌شده" icon={Zap} color="blue" progress={currentMetrics.averageFocus * 10} /></section>
-        <section className="panel performance-chart-panel"><div className="panel-heading"><div><div className="section-kicker">TREND ANALYSIS</div><h2>{chartMetric === 'hours' ? 'روند ساعت مطالعه' : 'روند تعداد تست'}</h2><p>فقط رکوردهای واقعی ثبت‌شده در این مرورگر نمایش داده می‌شوند.</p></div><div className="metric-switch"><button className={chartMetric === 'hours' ? 'selected' : ''} onClick={() => setChartMetric('hours')}><Clock3 size={14} /> ساعت</button><button className={chartMetric === 'tests' ? 'selected' : ''} onClick={() => setChartMetric('tests')}><Target size={14} /> تست</button></div></div>{chartPoints.length ? <LineChart points={chartPoints} metric={chartMetric} /> : <div className="empty-state chart-empty"><span><Activity size={22} /></span><strong>هنوز داده‌ای برای نمودار وجود ندارد</strong><p>اولین رکورد روزانه‌ات را ثبت کن تا روند عملکرد نمایش داده شود.</p><button className="secondary-button" onClick={() => setShowPerformanceForm(true)}>ثبت عملکرد</button></div>}</section>
-        <section className="panel performance-table-panel"><div className="table-panel-heading"><div><h2>ثبت‌های روزانه</h2><p>برای هر تاریخ یک رکورد نگه داشته می‌شود؛ ثبت دوباره همان روز آن را به‌روزرسانی می‌کند.</p></div><span className="table-count">{formatFa(selectedPerformance.length)} روز</span></div>{selectedPerformance.length ? <div className="performance-table">{[...selectedPerformance].reverse().map(item => <div className="performance-row" key={item.id}><strong>{isoToJalali(item.date)}</strong><span>{formatFa(item.hours)} ساعت</span><span>{formatFa(item.tests)} تست</span><span>صحیح {formatFa(item.correct)} · غلط {formatFa(item.wrong)} · نزده {formatFa(item.blank)}</span><span>تمرکز {formatFa(item.focus)}/۱۰</span><span>تست/ساعت {formatFa(item.hours > 0 ? item.tests / item.hours : 0)}</span><button className="row-more" onClick={() => { setPerformanceDateText(isoToJalali(item.date)); setPerformanceHours(String(item.hours)); setPlannedHours(String(item.planned)); setTestCount(String(item.tests)); setCorrectCount(String(item.correct)); setWrongCount(String(item.wrong)); setBlankCount(String(item.blank)); setFocusScore(String(item.focus)); setShowPerformanceForm(true) }} aria-label="ویرایش عملکرد"><MoreHorizontal size={18} /></button><button className="row-more" onClick={() => { if (window.confirm(`رکورد ${isoToJalali(item.date)} حذف شود؟`)) setPerformanceRecords(current => current.filter(row => row.id !== item.id)) }} aria-label="حذف عملکرد"><Trash2 size={15} /></button></div>)}</div> : <div className="empty-state"><span><CalendarDays size={22} /></span><strong>هنوز رکوردی در این بازه ثبت نشده</strong><p>برای هر روز، ساعت برنامه و واقعی و آمار تست‌ها را وارد کن.</p></div>}</section>
-        <section className="panel note-panel"><span className="note-icon"><CircleHelp size={17} /></span><div><strong>نحوهٔ محاسبه</strong><p>درصد پاسخ صحیح = صحیح ÷ تعداد کل تست‌ها. اجرای برنامه = میانگین ساعت مطالعهٔ واقعی ÷ ساعت برنامه در روزهایی که ساعت برنامه بزرگ‌تر از صفر است؛ همانند اکسل، مقدار از ۱۰۰٪ بیشتر هم می‌تواند باشد. این درصد، نمرهٔ کنکور با نمرهٔ منفی نیست.</p></div></section>
+        <section className="stats-grid performance-stats"><StatCard title="مجموع ساعت مطالعه" value={formatFa(currentMetrics.hours)} suffix="ساعت" delta={`${formatFa(selectedPerformance.length)} روز ثبت‌شده`} icon={Clock3} color="blue" progress={(chartRange === 7 ? studyGoals.weeklyHours : studyGoals.monthlyHours) > 0 ? Math.min(100, currentMetrics.hours / (chartRange === 7 ? studyGoals.weeklyHours : studyGoals.monthlyHours) * 100) : (currentMetrics.hours > 0 ? 100 : 0)} /><StatCard title="مجموع تست‌ها" value={formatFa(currentMetrics.tests)} suffix="تست" delta="تعداد کل ثبت‌شده" icon={Target} color="violet" progress={Math.min(100, currentMetrics.tests / (chartRange === 7 ? 250 : 1500) * 100)} /><StatCard title="میانگین روز ثبت‌شده" value={formatFa(currentMetrics.averageHours)} suffix="ساعت" delta="فقط روزهای دارای رکورد" icon={TrendingUp} color="green" progress={Math.min(100, currentMetrics.averageHours / 8 * 100)} /><StatCard title="درصد آزمون با نمرهٔ منفی" value={formatFa(Math.round(examPercentage * 10) / 10)} suffix="٪" delta="(صحیح × ۳ − غلط) ÷ (کل × ۳)" icon={CircleCheck} color="amber" progress={Math.max(0, Math.min(100, examPercentage))} /><StatCard title="اجرای برنامه" value={`${formatFa(Math.round(currentMetrics.planExecution))}`} suffix="٪" delta="میانگین ساعت واقعی ÷ برنامه" icon={Target} color="violet" progress={currentMetrics.planExecution} /><StatCard title="میانگین تمرکز" value={formatFa(currentMetrics.averageFocus)} suffix="/۱۰" delta="میانگین روزهای ثبت‌شده" icon={Zap} color="blue" progress={currentMetrics.averageFocus * 10} /></section>
+        <section className="panel performance-chart-panel"><div className="panel-heading"><div><div className="section-kicker">TREND ANALYSIS</div><h2>{chartMetric === 'hours' ? 'روند ساعت مطالعه' : 'روند تعداد تست'}</h2><p>فقط رکوردهای واقعی ثبت‌شده برای این حساب نمایش داده می‌شوند.</p></div><div className="metric-switch"><button className={chartMetric === 'hours' ? 'selected' : ''} onClick={() => setChartMetric('hours')}><Clock3 size={14} /> ساعت</button><button className={chartMetric === 'tests' ? 'selected' : ''} onClick={() => setChartMetric('tests')}><Target size={14} /> تست</button></div></div>{chartPoints.length ? <LineChart points={chartPoints} metric={chartMetric} /> : <div className="empty-state chart-empty"><span><Activity size={22} /></span><strong>هنوز داده‌ای برای نمودار وجود ندارد</strong><p>اولین رکورد روزانه‌ات را ثبت کن تا روند عملکرد نمایش داده شود.</p><button className="secondary-button" onClick={() => setShowPerformanceForm(true)}>ثبت عملکرد</button></div>}</section>
+        <section className="panel performance-table-panel"><div className="table-panel-heading"><div><h2>ثبت‌های روزانه</h2><p>برای هر تاریخ یک رکورد نگه داشته می‌شود؛ ثبت دوباره همان روز آن را به‌روزرسانی می‌کند.</p></div><span className="table-count">{formatFa(selectedPerformance.length)} روز</span></div>{selectedPerformance.length ? <div className="performance-table">{[...selectedPerformance].reverse().map(item => <div className="performance-row" key={item.id}><strong>{isoToJalali(item.date)}</strong><span>{formatFa(item.hours)} ساعت</span><span>{formatFa(item.tests)} تست</span><span>صحیح {formatFa(item.correct)} · غلط {formatFa(item.wrong)} · نزده {formatFa(item.blank)} · درصد آزمون {formatFa(item.tests > 0 ? Math.round(calculateExamPercentage({ total: item.tests, correct: item.correct, wrong: item.wrong, blank: item.blank }) * 10) / 10 : 0)}٪</span><span>تمرکز {formatFa(item.focus)}/۱۰</span><span>تست/ساعت {formatFa(item.hours > 0 ? item.tests / item.hours : 0)}</span><button className="row-more" onClick={() => { setPerformanceDateText(isoToJalali(item.date)); setPerformanceHours(String(item.hours)); setPlannedHours(String(item.planned)); setTestCount(String(item.tests)); setCorrectCount(String(item.correct)); setWrongCount(String(item.wrong)); setBlankCount(String(item.blank)); setFocusScore(String(item.focus)); setShowPerformanceForm(true) }} aria-label="ویرایش عملکرد"><MoreHorizontal size={18} /></button><button className="row-more" onClick={() => { if (window.confirm(`رکورد ${isoToJalali(item.date)} حذف شود؟`)) setPerformanceRecords(current => current.filter(row => row.id !== item.id)) }} aria-label="حذف عملکرد"><Trash2 size={15} /></button></div>)}</div> : <div className="empty-state"><span><CalendarDays size={22} /></span><strong>هنوز رکوردی در این بازه ثبت نشده</strong><p>برای هر روز، ساعت برنامه و واقعی و آمار تست‌ها را وارد کن.</p></div>}</section>
+        <section className="panel note-panel"><span className="note-icon"><CircleHelp size={17} /></span><div><strong>نحوهٔ محاسبه</strong><p>درصد آزمون = ((صحیح × ۳) − غلط) ÷ (کل تست‌ها × ۳) × ۱۰۰؛ پاسخ نزده امتیاز صفر دارد. تعداد صحیح، غلط و نزده باید دقیقاً برابر کل تست‌ها باشد. اجرای برنامه نیز از میانگین ساعت واقعی نسبت به ساعت برنامه محاسبه می‌شود.</p></div></section>
       </div>}
 
       {activePage === 'settings' && <div className="page-wrap page-enter settings-page"><section className="welcome-row"><div><div className="eyebrow"><span className="status-dot" /> تنظیمات برنامه</div><h1>تنظیمات <span>و داده‌ها</span></h1><p className="page-subtitle">فاصله‌های مرور، ظاهر و مدیریت پشتیبان اطلاعات.</p></div></section>
+        <section className="panel interval-settings"><div className="table-panel-heading"><div><h2>هدف‌های مطالعه</h2><p>مقادیر هدف را تغییر بده؛ پیشرفت داشبورد بر اساس همین اعداد محاسبه می‌شود.</p></div></div><div className="goal-settings-fields"><label className="form-field"><span>هدف ساعت هفتگی (۰ تا ۱۶۸)</span><input type="number" min="0" max="168" step="0.5" value={studyGoals.weeklyHours} onChange={event => updateStudyGoal('weeklyHours', event.target.value)} /></label><label className="form-field"><span>هدف ساعت ماهانه (۰ تا ۷۴۴)</span><input type="number" min="0" max="744" step="0.5" value={studyGoals.monthlyHours} onChange={event => updateStudyGoal('monthlyHours', event.target.value)} /></label></div></section>
         <section className="panel interval-settings"><div className="table-panel-heading"><div><h2>فاصله‌های مرور</h2><p>با تغییر فاصله، موعدهای موجود نیز از تاریخ شروع دوباره محاسبه می‌شوند.</p></div></div><div className="interval-fields">{intervals.map((value, index) => <label className="select-field" key={index}><span>مرور شمارهٔ {formatFa(index + 1)} (روز)</span><input type="number" min="1" max="365" value={value} onChange={event => updateIntervals(index, event.target.value)} /></label>)}</div></section>
-        <section className="panel interval-settings cloud-panel"><div className="table-panel-heading"><div><h2>حساب و همگام‌سازی ابری</h2><p>اطلاعات فقط با اقدام خودت ارسال یا دریافت می‌شود؛ همگام‌سازی خودکار در این نسخه فعال نیست.</p></div><span className={`status-dot ${cloudSession ? '' : 'muted'}`} /></div>
-          {!cloudConfigured() ? <div className="form-info"><CircleHelp size={16} /><span>اتصال Supabase تنظیم نشده است. فایل راهنمای CLOUD-SETUP.md را دنبال کن و متغیرهای محیطی را در تنظیمات GitHub وارد کن.</span></div> : !cloudSession ? <form className="cloud-auth-form" onSubmit={cloudSignIn}><label className="form-field"><span>ایمیل</span><input type="email" autoComplete="email" value={cloudEmail} onChange={event => setCloudEmail(event.target.value)} required placeholder="you@example.com" /></label><label className="form-field"><span>رمز عبور</span><input type="password" autoComplete="current-password" minLength={6} value={cloudPassword} onChange={event => setCloudPassword(event.target.value)} required /></label><div className="form-actions"><button className="secondary-button" type="button" disabled={cloudBusy || !cloudReady} onClick={cloudSignUp}>ساخت حساب</button><button className="primary-button" type="submit" disabled={cloudBusy || !cloudReady}>{cloudBusy ? 'در حال انجام…' : 'ورود'}</button></div></form> : <><div className="form-info"><CircleCheck size={16} /><span>وارد شده‌ای: {cloudSession.user.email ?? 'حساب کاربری'}</span></div><div className="form-actions cloud-actions"><button className="secondary-button" disabled={cloudBusy} onClick={uploadCloudState}>ارسال اطلاعات به ابر</button><button className="secondary-button" disabled={cloudBusy} onClick={downloadCloudState}>دریافت از ابر</button><button className="secondary-button" disabled={cloudBusy} onClick={cloudSignOut}>خروج</button></div></>}
+        <section className="panel interval-settings cloud-panel"><div className="table-panel-heading"><div><h2>حساب و همگام‌سازی ابری</h2><p>تغییرات به‌طور خودکار ذخیره و بین نشست‌های هم‌زمان حساب همگام می‌شوند.</p></div><span className={`status-dot ${cloudSession ? '' : 'muted'}`} /></div>
+          {!cloudConfigured() ? <div className="form-info"><CircleHelp size={16} /><span>اتصال Supabase تنظیم نشده است. فایل راهنمای CLOUD-SETUP.md را دنبال کن و متغیرهای محیطی را در تنظیمات GitHub وارد کن.</span></div> : !cloudSession ? <form className="cloud-auth-form" onSubmit={cloudSignIn}><label className="form-field"><span>ایمیل</span><input type="email" autoComplete="email" value={cloudEmail} onChange={event => setCloudEmail(event.target.value)} required placeholder="you@example.com" /></label><label className="form-field"><span>رمز عبور</span><input type="password" autoComplete="current-password" minLength={6} value={cloudPassword} onChange={event => setCloudPassword(event.target.value)} required /></label><div className="form-actions"><button className="secondary-button" type="button" disabled={cloudBusy || !cloudReady} onClick={cloudSignUp}>ساخت حساب</button><button className="primary-button" type="submit" disabled={cloudBusy || !cloudReady}>{cloudBusy ? 'در حال انجام…' : 'ورود'}</button></div></form> : <><div className="form-info"><CircleCheck size={16} /><span>وارد شده‌ای: {cloudSession.user.email ?? 'حساب کاربری'} · همگام‌سازی خودکار فعال است.</span></div><div className="form-actions cloud-actions"><button className="secondary-button" disabled={cloudBusy} onClick={uploadCloudState}>ارسال اطلاعات به ابر</button><button className="secondary-button" disabled={cloudBusy} onClick={downloadCloudState}>دریافت از ابر</button><button className="secondary-button" disabled={cloudBusy} onClick={cloudSignOut}>خروج</button></div></>}
         </section>
         <section className="settings-grid"><div className="panel settings-card"><div className="setting-symbol"><Sun size={19} /></div><div className="setting-copy"><strong>تم رنگی</strong><p>میان حالت تیره و روشن جابه‌جا شو.</p></div><button className="theme-setting-button" onClick={() => setTheme(value => value === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <><Sun size={16} /> حالت روشن</> : <><Moon size={16} /> حالت تیره</>}</button></div>
           <div className="panel settings-card"><div className="setting-symbol"><Zap size={19} /></div><div className="setting-copy"><strong>کاهش حرکت</strong><p>حرکت‌ها و انتقال‌های تزئینی را محدود کن.</p></div><button className={`switch ${reduceMotion ? 'on' : ''}`} role="switch" aria-checked={reduceMotion} onClick={() => setReduceMotion(value => !value)}><span /></button></div>
@@ -506,21 +696,42 @@ function App() {
           <div className="panel settings-card"><div className="setting-symbol"><FileSpreadsheet size={19} /></div><div className="setting-copy"><strong>خروجی اکسل</strong><p>فهرست مرور و عملکرد را در دو برگه ذخیره کن.</p></div><button className="secondary-button" onClick={exportExcel}><Download size={15} /> خروجی</button></div>
           <div className="panel settings-card"><div className="setting-symbol"><GripVertical size={19} /></div><div className="setting-copy"><strong>چیدمان داشبورد</strong><p>ترتیب کارت‌ها را به حالت اولیه برگردان.</p></div><button className="secondary-button" onClick={() => { setPanelOrder(PANEL_ORDER); setNotice('چیدمان داشبورد بازنشانی شد.') }}><RotateCcw size={15} /> بازنشانی</button></div>
         </section>
-        <div className="settings-disclaimer"><CircleHelp size={16} /><span>تاریخ امروز از ساعت محلی دستگاه گرفته و با الگوریتم تقویم جلالی تبدیل می‌شود؛ برای این کار اتصال به Google یا اینترنت لازم نیست. اطلاعات محلی در همین مرورگر ذخیره می‌شود. برای همگام‌سازی، از بخش حساب و همگام‌سازی ابری به‌صورت دستی ارسال یا دریافت کن؛ پیش از جایگزینی داده‌ها پشتیبان بگیر.</span></div>
+        <div className="settings-disclaimer"><CircleHelp size={16} /><span>تاریخ امروز هنگام اتصال از زمان پاسخ سایت با منطقهٔ زمانی تهران گرفته می‌شود و در حالت آفلاین از ساعت دستگاه استفاده می‌کند؛ برای تبدیل تقویم جلالی اتصال جداگانه لازم نیست. اطلاعات حساب در فضای ابری ذخیره می‌شود و روی دستگاه‌های واردشده به همان حساب به‌روزرسانی می‌شود. تغییر هم‌زمان یک رکورد از چند دستگاه ممکن است به آخرین ذخیره وابسته باشد؛ برای داده‌های مهم همچنان پشتیبان بگیر.</span></div>
         <input ref={importInputRef} type="file" accept=".json,.xlsx,.xls,.xlsm" hidden onChange={event => { handleImport(event.target.files?.[0]); event.currentTarget.value = '' }} />
       </div>}
     </main>
 
     <nav className="mobile-nav" aria-label="ناوبری موبایل">{NAV.map(({ key, label, icon: Icon }) => <button key={key} className={activePage === key ? 'active' : ''} onClick={() => setActivePage(key)}><Icon size={19} /><span>{label}</span></button>)}</nav>
 
-    {showReviewForm && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setShowReviewForm(false) }}><form className="data-modal" onSubmit={addStudyItem} role="dialog" aria-modal="true" aria-label="افزودن موضوع مرور"><div className="data-modal-heading"><div><h2>افزودن موضوع برای مرور</h2><p>پنج موعد بر اساس فاصله‌های تنظیم‌شده ساخته می‌شود.</p></div><button type="button" className="icon-button" onClick={() => setShowReviewForm(false)} aria-label="بستن"><X size={17} /></button></div><label className="form-field"><span>درس</span><select value={reviewSubject} onChange={event => setReviewSubject(event.target.value)}>{subjectsForForm.map(subject => <option key={subject}>{subject}</option>)}</select></label><label className="form-field"><span>جلسه یا موضوع</span><input value={reviewTitle} onChange={event => setReviewTitle(event.target.value)} placeholder="مثلاً استوکیومتری — جلسه ۸" required autoFocus /></label><label className="form-field"><span>تاریخ اتمام جلسه (شمسی)</span><input type="text" inputMode="numeric" value={reviewBaseDateText} onChange={event => setReviewBaseDateText(event.target.value)} placeholder="۱۴۰۵/۰۸/۰۵" required /></label><div className="form-info"><CalendarDays size={15} /><span>موعدها: {intervals.map(value => `${formatFa(value)} روز`).join('، ')} پس از تاریخ شروع.</span></div><div className="form-actions"><button type="button" className="secondary-button" onClick={() => setShowReviewForm(false)}>انصراف</button><button type="submit" className="primary-button"><Plus size={15} /> ساخت موعدها</button></div></form></div>}
+    {showReviewForm && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setShowReviewForm(false) }}><form className="data-modal" onSubmit={addStudyItem} role="dialog" aria-modal="true" aria-label="افزودن موضوع مرور"><div className="data-modal-heading"><div><h2>افزودن موضوع برای مرور</h2><p>پنج موعد بر اساس فاصله‌های تنظیم‌شده ساخته می‌شود.</p></div><button type="button" className="icon-button" onClick={() => setShowReviewForm(false)} aria-label="بستن"><X size={17} /></button></div><label className="form-field"><span>درس</span><select value={reviewSubject} onChange={event => setReviewSubject(event.target.value)}>{subjectsForForm.map(subject => <option key={subject}>{subject}</option>)}</select></label><label className="form-field"><span>جلسه یا موضوع</span><input value={reviewTitle} onChange={event => setReviewTitle(event.target.value)} placeholder="مثلاً استوکیومتری — جلسه ۸" required autoFocus /></label><PersianDatePicker label="تاریخ اتمام جلسه" value={reviewBaseDateText} onChange={setReviewBaseDateText} todayDate={today} /><div className="form-info"><CalendarDays size={15} /><span>موعدها: {intervals.map(value => `${formatFa(value)} روز`).join('، ')} پس از تاریخ شروع.</span></div><div className="form-actions"><button type="button" className="secondary-button" onClick={() => setShowReviewForm(false)}>انصراف</button><button type="submit" className="primary-button"><Plus size={15} /> ساخت موعدها</button></div></form></div>}
 
-    {showPerformanceForm && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setShowPerformanceForm(false) }}><form className="data-modal wide-modal" onSubmit={savePerformance} role="dialog" aria-modal="true" aria-label="ثبت عملکرد مطالعه"><div className="data-modal-heading"><div><h2>ثبت عملکرد روزانه</h2><p>برای هر تاریخ یک رکورد نگه داشته می‌شود.</p></div><button type="button" className="icon-button" onClick={() => setShowPerformanceForm(false)} aria-label="بستن"><X size={17} /></button></div><div className="form-grid"><label className="form-field"><span>تاریخ (شمسی)</span><input type="text" inputMode="numeric" value={performanceDateText} onChange={event => setPerformanceDateText(event.target.value)} placeholder="۱۴۰۵/۰۸/۰۵" required /></label><label className="form-field"><span>ساعت مطالعه</span><input type="number" min="0" max="24" step="0.25" value={performanceHours} onChange={event => setPerformanceHours(event.target.value)} placeholder="مثلاً ۵٫۵" required /></label><label className="form-field"><span>ساعت برنامه</span><input type="number" min="0" max="24" step="0.25" value={plannedHours} onChange={event => setPlannedHours(event.target.value)} placeholder="مثلاً ۶" required /></label><label className="form-field"><span>کل تست‌ها</span><input type="number" min="0" step="1" value={testCount} onChange={event => setTestCount(event.target.value)} placeholder="مثلاً ۴۰" required /></label><label className="form-field"><span>صحیح</span><input type="number" min="0" step="1" value={correctCount} onChange={event => setCorrectCount(event.target.value)} placeholder="مثلاً ۳۰" required /></label><label className="form-field"><span>غلط</span><input type="number" min="0" step="1" value={wrongCount} onChange={event => setWrongCount(event.target.value)} placeholder="مثلاً ۷" required /></label><label className="form-field"><span>نزده</span><input type="number" min="0" step="1" value={blankCount} onChange={event => setBlankCount(event.target.value)} placeholder="مثلاً ۳" required /></label><label className="form-field"><span>تمرکز (۰ تا ۱۰)</span><input type="number" min="0" max="10" step="1" value={focusScore} onChange={event => setFocusScore(event.target.value)} required /></label></div><div className="form-info"><CircleHelp size={15} /><span>صحیح + غلط + نزده باید از کل تست‌ها بیشتر نباشد. درصد صحیح با تقسیم صحیح بر کل تست‌ها محاسبه می‌شود.</span></div><div className="form-actions"><button type="button" className="secondary-button" onClick={() => setShowPerformanceForm(false)}>انصراف</button><button type="submit" className="primary-button"><Check size={15} /> ذخیرهٔ عملکرد</button></div></form></div>}
+    {showPerformanceForm && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setShowPerformanceForm(false) }}><form className="data-modal wide-modal" onSubmit={savePerformance} role="dialog" aria-modal="true" aria-label="ثبت عملکرد مطالعه"><div className="data-modal-heading"><div><h2>ثبت عملکرد روزانه</h2><p>برای هر تاریخ یک رکورد نگه داشته می‌شود.</p></div><button type="button" className="icon-button" onClick={() => setShowPerformanceForm(false)} aria-label="بستن"><X size={17} /></button></div><div className="form-grid"><PersianDatePicker label="تاریخ عملکرد" value={performanceDateText} onChange={setPerformanceDateText} todayDate={today} /><label className="form-field"><span>ساعت مطالعه</span><input type="number" min="0" max="24" step="0.25" value={performanceHours} onChange={event => setPerformanceHours(event.target.value)} placeholder="مثلاً ۵٫۵" required /></label><label className="form-field"><span>ساعت برنامه</span><input type="number" min="0" max="24" step="0.25" value={plannedHours} onChange={event => setPlannedHours(event.target.value)} placeholder="مثلاً ۶" required /></label><label className="form-field"><span>کل تست‌ها</span><input type="number" min="0" step="1" value={testCount} onChange={event => setTestCount(event.target.value)} placeholder="مثلاً ۴۰" required /></label><label className="form-field"><span>صحیح</span><input type="number" min="0" step="1" value={correctCount} onChange={event => setCorrectCount(event.target.value)} placeholder="مثلاً ۳۰" required /></label><label className="form-field"><span>غلط</span><input type="number" min="0" step="1" value={wrongCount} onChange={event => setWrongCount(event.target.value)} placeholder="مثلاً ۷" required /></label><label className="form-field"><span>نزده</span><input type="number" min="0" step="1" value={blankCount} onChange={event => setBlankCount(event.target.value)} placeholder="مثلاً ۳" required /></label><label className="form-field"><span>تمرکز (۰ تا ۱۰)</span><input type="number" min="0" max="10" step="1" value={focusScore} onChange={event => setFocusScore(event.target.value)} required /></label></div><div className="form-info"><CircleHelp size={15} /><span>فرمول درصد: ((صحیح × ۳) − غلط) ÷ (کل تست‌ها × ۳) × ۱۰۰. تعداد صحیح، غلط و نزده باید دقیقاً برابر کل تست‌ها باشد؛ نزده امتیاز صفر دارد.</span></div><div className="form-actions"><button type="button" className="secondary-button" onClick={() => setShowPerformanceForm(false)}>انصراف</button><button type="submit" className="primary-button"><Check size={15} /> ذخیرهٔ عملکرد</button></div></form></div>}
 
     {searchOpen && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setSearchOpen(false) }}><div className="command-modal" role="dialog" aria-modal="true" aria-label="جست‌وجو و فرمان"><div className="command-input"><Search size={19} /><input ref={commandInputRef} value={commandQuery} onChange={event => setCommandQuery(event.target.value)} onKeyDown={event => { if (event.key === 'ArrowDown') { event.preventDefault(); setCommandIndex(index => Math.min(filteredCommands.length - 1, index + 1)) } else if (event.key === 'ArrowUp') { event.preventDefault(); setCommandIndex(index => Math.max(0, index - 1)) } else if (event.key === 'Enter') { event.preventDefault(); runCommand(filteredCommands[commandIndex]) } }} placeholder="جست‌وجو یا اجرای فرمان..." /><kbd>ESC</kbd><button onClick={() => setSearchOpen(false)} aria-label="بستن"><X size={17} /></button></div><div className="command-label">{commandQuery ? 'نتایج جست‌وجو' : 'فرمان‌های پیشنهادی'}</div><div className="command-results">{filteredCommands.length ? filteredCommands.map((item, index) => { const Icon = item.icon; return <button className={`command-result ${commandIndex === index ? 'selected' : ''}`} key={item.id} onMouseEnter={() => setCommandIndex(index)} onClick={() => runCommand(item)}><Icon size={17} /><span className="command-result-copy"><strong>{item.label}</strong><small>{item.description}</small></span><ArrowDownLeft size={14} /></button> }) : <div className="command-empty">فرمانی با این عبارت پیدا نشد.</div>}</div><div className="command-hint"><span><kbd>↑</kbd><kbd>↓</kbd> حرکت</span><span><kbd>↵</kbd> اجرا</span><span><kbd>ESC</kbd> بستن</span></div></div></div>}
     {notice && <div className="toast" role="status"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="بستن پیام"><X size={16} /></button></div>}
   </div>
 }
+
+function PersianDatePicker({ label, value, onChange, todayDate }: { label: string; value: string; onChange: (value: string) => void; todayDate: string }) {
+  const parse = (input: string) => {
+    const match = toLatinDigits(input).match(/(\d{4})\/(\d{1,2})\/(\d{1,2})/)
+    return match ? { jy: Number(match[1]), jm: Number(match[2]), jd: Number(match[3]) } : null
+  }
+  const selected = parse(value)
+  const [todayGy, todayGm, todayGd] = todayDate.split('-').map(Number)
+  const todayJalali = toJalaali(todayGy || new Date().getFullYear(), todayGm || new Date().getMonth() + 1, todayGd || new Date().getDate())
+  const [open, setOpen] = useState(false)
+  const [year, setYear] = useState(selected?.jy ?? todayJalali.jy)
+  const [month, setMonth] = useState(selected?.jm ?? todayJalali.jm)
+  useEffect(() => { if (open) { const current = parse(value); if (current) { setYear(current.jy); setMonth(current.jm) } } }, [open, value])
+  const shiftMonth = (delta: number) => { const next = month + delta; if (next < 1) { setYear(year - 1); setMonth(12) } else if (next > 12) { setYear(year + 1); setMonth(1) } else setMonth(next) }
+  const first = toGregorian(year, month, 1)
+  const offset = (new Date(first.gy, first.gm - 1, first.gd).getDay() + 1) % 7
+  const days = jalaaliMonthLength(year, month)
+  const cells = Array.from({ length: offset + days }, (_, index) => index < offset ? null : index - offset + 1)
+  return <div className="form-field"><span>{label} (شمسی)</span><div className="date-picker-field"><button type="button" className="date-trigger" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(current => !current)}><CalendarDays size={17} /><span>{value || 'انتخاب تاریخ'}</span><ChevronCalendar open={open} /></button>{open && <div className="persian-date-popover" role="dialog" aria-label={`انتخاب ${label}`}><div className="calendar-head"><button type="button" className="calendar-nav" onClick={() => shiftMonth(-1)} aria-label="ماه قبل"><ChevronRight size={16} /></button><strong>{PERSIAN_MONTHS[month - 1]} {formatFa(year)}</strong><button type="button" className="calendar-nav next" onClick={() => shiftMonth(1)} aria-label="ماه بعد"><ChevronLeft size={16} /></button></div><div className="calendar-weekdays">{['ش', 'ی', 'د', 'س', 'چ', 'پ', 'ج'].map(day => <span key={day}>{day}</span>)}</div><div className="calendar-days">{cells.map((day, index) => day === null ? <span key={`empty-${index}`} /> : <button type="button" key={day} className={selected?.jy === year && selected?.jm === month && selected?.jd === day ? 'selected' : ''} onClick={() => { onChange(formatJalaliDate(year, month, day)); setOpen(false) }}>{formatFa(day)}</button>)}</div><div className="calendar-foot"><button type="button" className="text-button" onClick={() => { onChange(formatJalaliDate(todayJalali.jy, todayJalali.jm, todayJalali.jd)); setYear(todayJalali.jy); setMonth(todayJalali.jm); setOpen(false) }}>امروز</button><button type="button" className="text-button" onClick={() => setOpen(false)}>بستن</button></div></div>}</div></div>
+}
+function ChevronCalendar({ open }: { open: boolean }) { return <span className={`calendar-chevron ${open ? 'open' : ''}`}>⌄</span> }
 
 function PanelTools({ id, onDragStart, onDragEnd, onMoveUp, onMoveDown }: { id: PanelKey; onDragStart: () => void; onDragEnd: () => void; onMoveUp: () => void; onMoveDown: () => void }) {
   return <div className="drag-tools" title="برای تغییر ترتیب کارت بکش یا از فلش‌ها استفاده کن"><button className="move-button" aria-label="انتقال کارت به بالا" onClick={onMoveUp}><MoveUp size={13} /></button><button className="drag-handle" draggable onDragStart={event => { event.dataTransfer?.setData('text/plain', id); if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'; onDragStart() }} onDragEnd={onDragEnd} aria-label="گرفتن و جابه‌جایی کارت"><GripVertical size={17} /></button><button className="move-button" aria-label="انتقال کارت به پایین" onClick={onMoveDown}><MoveDown size={13} /></button></div>
@@ -535,10 +746,13 @@ function WeeklyPanel({ points, range, onRangeChange, onMoveUp, onMoveDown, onDra
   const data = points.slice(-range); const max = Math.max(1, ...data.map(point => point.hours)); const hours = data.reduce((sum, point) => sum + point.hours, 0)
   return <article className="panel weekly-panel"><PanelHeading eyebrow="CONSISTENCY" title="ریتم مطالعه" subtitle="ساعت‌های ثبت‌شده در بازهٔ انتخاب‌شده" tools={<PanelTools id="weekly" onDragStart={onDragStart} onDragEnd={onDragEnd} onMoveUp={onMoveUp} onMoveDown={onMoveDown} />}><select className="period-select" value={range} onChange={event => onRangeChange(Number(event.target.value) as 7 | 30)} aria-label="بازهٔ زمانی"><option value={7}>۷ روز اخیر</option><option value={30}>۳۰ روز اخیر</option></select></PanelHeading><div className="chart-summary"><strong>{formatFa(hours)} <small>ساعت</small></strong><span className="sample-note">{formatFa(data.length)} روز ثبت‌شده</span></div>{data.length ? <div className={`bar-chart ${range === 30 ? 'long-range' : ''}`} role="img" aria-label={`نمودار ساعت مطالعه در ${range} روز اخیر`}>{data.map((point, index) => <div className="bar-column" key={point.id} title={`${isoToJalali(point.date)}: ${formatFa(point.hours)} ساعت`}><span className="bar-value">{range === 7 || index % 4 === 0 ? formatFa(point.hours) : ''}</span><div className="bar-rail"><span className={`bar-fill ${index === data.length - 1 ? 'highlight' : ''}`} style={{ height: `${point.hours / max * 100}%` }} /></div><span className="bar-day">{range === 7 || index % 4 === 0 ? point.day.split(' ')[0] : ''}</span></div>)}</div> : <div className="mini-empty">با ثبت عملکرد روزانه، نمودار اینجا نمایش داده می‌شود.</div>}<div className="chart-footer"><span><i className="legend-dot" /> ساعت مطالعه</span><span>دادهٔ ساختگی نمایش داده نمی‌شود.</span></div></article>
 }
-function GoalPanel({ points, range, onMoveUp, onMoveDown, onDragStart, onDragEnd }: { points: PerformancePoint[]; range: 7 | 30; onMoveUp: () => void; onMoveDown: () => void; onDragStart: () => void; onDragEnd: () => void }) {
-  const actual = points.reduce((sum, point) => sum + point.hours, 0); const target = range === 7 ? 35 : 150; const percent = Math.min(100, Math.round(actual / target * 100))
-  return <article className="panel goal-panel"><PanelHeading eyebrow="PERIOD TARGET" title="هدف بازه" subtitle="پیشرفت نسبت به هدف مرجع" tools={<PanelTools id="goal" onDragStart={onDragStart} onDragEnd={onDragEnd} onMoveUp={onMoveUp} onMoveDown={onMoveDown} />} /><div className="ring-wrap"><svg viewBox="0 0 180 180" className="progress-ring" aria-label={`${formatFa(percent)} درصد از هدف`}><circle cx="90" cy="90" r="72" className="ring-track" /><circle cx="90" cy="90" r="72" className="ring-value" style={{ strokeDashoffset: `${452.4 * (1 - percent / 100)}` }} /></svg><div className="ring-center"><strong>{formatFa(percent)}٪</strong><span>از هدف مرجع</span></div></div><div className="goal-meta"><span>{formatFa(actual)} از {formatFa(target)} ساعت</span><strong>{formatFa(Math.max(0, target - actual))} ساعت باقی‌مانده</strong></div><div className="goal-progress"><span style={{ width: `${percent}%` }} /></div><div className="goal-note"><Zap size={15} /><span>هدف ۳۵ ساعت هفتگی یا ۱۵۰ ساعت ماهانه، مقدار مرجع اولیه است.</span></div></article>
+function GoalPanel({ points, range, goals, onGoalChange, onMoveUp, onMoveDown, onDragStart, onDragEnd }: { points: PerformancePoint[]; range: 7 | 30; goals: StudyGoalSettings; onGoalChange: (key: keyof StudyGoalSettings, value: string) => void; onMoveUp: () => void; onMoveDown: () => void; onDragStart: () => void; onDragEnd: () => void }) {
+  const actual = points.reduce((sum, point) => sum + point.hours, 0)
+  const target = range === 7 ? goals.weeklyHours : goals.monthlyHours
+  const percent = target > 0 ? Math.min(100, Math.round(actual / target * 100)) : (actual > 0 ? 100 : 0)
+  return <article className="panel goal-panel"><PanelHeading eyebrow="PERIOD TARGET" title="هدف بازه" subtitle="هدف واقعی و قابل‌تنظیم مطالعه" tools={<PanelTools id="goal" onDragStart={onDragStart} onDragEnd={onDragEnd} onMoveUp={onMoveUp} onMoveDown={onMoveDown} />} /><div className="ring-wrap"><svg viewBox="0 0 180 180" className="progress-ring" aria-label={`${formatFa(percent)} درصد از هدف`}><circle cx="90" cy="90" r="72" className="ring-track" /><circle cx="90" cy="90" r="72" className="ring-value" style={{ strokeDashoffset: `${452.4 * (1 - percent / 100)}` }} /></svg><div className="ring-center"><strong>{formatFa(percent)}٪</strong><span>از هدف بازه</span></div></div><div className="goal-meta"><span>{formatFa(actual)} از {formatFa(target)} ساعت</span><strong>{formatFa(Math.max(0, target - actual))} ساعت باقی‌مانده</strong></div><div className="goal-progress"><span style={{ width: `${percent}%` }} /></div><div className="goal-edit-fields"><label><span>هدف هفتگی (ساعت)</span><input type="number" min="0" max="168" step="0.5" value={goals.weeklyHours} onChange={event => onGoalChange('weeklyHours', event.target.value)} aria-label="هدف ساعت هفتگی" /></label><label><span>هدف ماهانه (ساعت)</span><input type="number" min="0" max="744" step="0.5" value={goals.monthlyHours} onChange={event => onGoalChange('monthlyHours', event.target.value)} aria-label="هدف ساعت ماهانه" /></label></div><div className="goal-note"><Zap size={15} /><span>{range === 7 ? 'نمایش هدف هفتگی' : 'نمایش هدف ماهانه'}؛ پیشرفت از ساعات ثبت‌شدهٔ همین بازه محاسبه می‌شود.</span></div></article>
 }
+
 function ReviewsPanel({ reviews, today, onToggle, onViewAll, onAdd, onMoveUp, onMoveDown, onDragStart, onDragEnd }: { reviews: ReviewItem[]; today: string; onToggle: (id: string) => void; onViewAll: () => void; onAdd: () => void; onMoveUp: () => void; onMoveDown: () => void; onDragStart: () => void; onDragEnd: () => void }) {
   const nextReviews = [...reviews].filter(item => !item.done).sort((a, b) => a.dueDate.localeCompare(b.dueDate)).slice(0, 3)
   return <article className="panel reviews-panel"><PanelHeading eyebrow="UP NEXT" title="مرورهای پیشِ رو" subtitle="نزدیک‌ترین موعدها" tools={<PanelTools id="reviews" onDragStart={onDragStart} onDragEnd={onDragEnd} onMoveUp={onMoveUp} onMoveDown={onMoveDown} />}><button className="text-button" onClick={onViewAll}>مشاهدهٔ همه <ArrowDownLeft size={15} /></button></PanelHeading>{nextReviews.length ? <div className="review-list">{nextReviews.map(item => { const days = getDueDays(item, today); return <div className="review-row" key={item.id}><div className={`subject-avatar ${item.tone}`}>{item.subject.slice(0, 1)}</div><div className="review-main"><strong>{item.title}</strong><span>{item.subject} <i /> {item.stage}</span></div><div className={`due-label ${days < 0 ? 'overdue' : ''}`}><span />{getDueLabel(item, today)}</div><button className="complete-button" aria-label={`تکمیل ${item.title}`} onClick={() => onToggle(item.id)}><Check size={16} /></button></div> })}</div> : <div className="mini-empty">مروری برای نمایش وجود ندارد.</div>}<button className="add-review-button" onClick={onAdd}><Plus size={16} /> افزودن موضوع به برنامهٔ مرور</button></article>
