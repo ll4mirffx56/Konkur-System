@@ -246,7 +246,7 @@ export async function saveCloudStateSafely(
 
     const merged = remote ? mergeCloudPayloads(baseline, candidate, remote) : candidate
     if (remote && samePayload(merged, remote)) {
-      return { payload: remote, updatedAt: currentRow.updated_at }
+      return { payload: remote, updatedAt: currentRow?.updated_at ?? new Date().toISOString() }
     }
 
     const { data, error } = await client.rpc('save_user_app_state', {

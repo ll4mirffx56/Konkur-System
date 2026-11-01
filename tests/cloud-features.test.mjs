@@ -35,8 +35,9 @@ test('cloud state is loaded before dashboard use and invalid data is rejected', 
 })
 
 test('cloud data auto-saves with debounce and subscribes to Postgres changes', () => {
-  assert.match(app, /supabase\.channel\(`moroor-state-\$\{userId\}`\)/)
+  assert.match(app, /client\.channel\(`moroor-state-\$\{userId\}`\)/)
   assert.match(app, /on\('postgres_changes'/)
+  assert.match(app, /const client = supabase[\s\S]{0,100}if \(!client \|\| !userId\)/)
   assert.match(app, /setTimeout\(\(\) =>/)
   assert.match(app, /همگام‌سازی خودکار فعال است/)
 })

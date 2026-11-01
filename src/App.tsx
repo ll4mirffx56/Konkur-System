@@ -210,11 +210,12 @@ function App() {
     return () => { cancelled = true }
   }, [])
   useEffect(() => {
-    if (!supabase) { setCloudReady(true); return }
+    const client = supabase
+    if (!client) { setCloudReady(true); return }
     let alive = true
     const initializeSession = async () => {
       try {
-        const { data, error } = await supabase.auth.getSession()
+        const { data, error } = await client.auth.getSession()
         if (error) throw error
         if (alive) { setCloudSession(data.session); setCloudReady(true) }
       } catch (error) {
@@ -225,7 +226,7 @@ function App() {
       }
     }
     void initializeSession()
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: listener } = client.auth.onAuthStateChange((_event, session) => {
       setCloudSession(session)
       setCloudReady(true)
     })
@@ -233,8 +234,9 @@ function App() {
   }, [])
 
   useEffect(() => {
+    const client = supabase
     const userId = cloudSession?.user.id
-    if (!supabase || !userId) {
+    if (!client || !userId) {
       setCloudHydrated(false)
       setCloudHydratedUserId(null)
       setCloudLoadError('')
@@ -250,7 +252,7 @@ function App() {
     lastSyncedPayloadRef.current = null
     livePayloadRef.current = null
 
-    const channel = supabase.channel(`moroor-state-${userId}`)
+    const channel = client.channel(`moroor-state-${userId}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'user_app_state', filter: `user_id=eq.${userId}` }, payload => {
         if (!alive || !lastSyncedPayloadRef.current) return
         const row = payload.new as { payload?: unknown; updated_at?: string } | null
@@ -297,7 +299,7 @@ function App() {
         }
 
         const baseline = remote ?? makeEmptyCloudPayload()
-        const saved = await saveCloudStateSafely(supabase, userId, initial, baseline)
+        const saved = await saveCloudStateSafely(client, userId, initial, baseline)
         if (!alive) return
         applyCloudPayload(saved.payload, true)
         lastSyncedPayloadRef.current = saved.payload
@@ -314,7 +316,7 @@ function App() {
       }
     }
     void hydrate()
-    return () => { alive = false; void supabase?.removeChannel(channel) }
+    return () => { alive = false; void client.removeChannel(channel) }
   }, [cloudSession?.user.id, cloudRetry])
   useEffect(() => { document.documentElement.dataset.theme = theme; try { localStorage.setItem(STORE.theme, theme) } catch { /* storage unavailable */ } }, [theme])
   useEffect(() => { document.documentElement.dataset.reduceMotion = reduceMotion ? 'true' : 'false'; try { localStorage.setItem(STORE.reduceMotion, String(reduceMotion)) } catch { /* storage unavailable */ } }, [reduceMotion])
@@ -324,8 +326,9 @@ function App() {
   useEffect(() => { try { localStorage.setItem(STORE.intervals, JSON.stringify(intervals)) } catch { /* settings still work in this session */ } }, [intervals])
   useEffect(() => { try { localStorage.setItem(STORE.studyGoals, JSON.stringify(studyGoals)) } catch { setNotice('ذخیرهٔ هدف‌های مطالعه انجام نشد.') } }, [studyGoals])
   useEffect(() => {
+    const client = supabase
     const userId = cloudSession?.user.id
-    if (!supabase || !userId || !cloudHydrated || cloudHydratedUserId !== userId) return
+    if (!client || !userId || !cloudHydrated || cloudHydratedUserId !== userId) return
     const snapshot = currentCloudPayload()
     const baseline = lastSyncedPayloadRef.current
     if (baseline && JSON.stringify(snapshot) === JSON.stringify(baseline)) return
@@ -335,7 +338,7 @@ function App() {
       const baseAtExecution = lastSyncedPayloadRef.current ?? makeEmptyCloudPayload()
       void (async () => {
         try {
-          const saved = await saveCloudStateSafely(supabase, userId, freshest, baseAtExecution)
+          const saved = await saveCloudStateSafely(client, userId, freshest, baseAtExecution)
           lastSyncedPayloadRef.current = saved.payload
           writeSyncedPayload(userId, saved.payload)
           try { localStorage.setItem(`${ACCOUNT_CACHE_PREFIX}${userId}`, JSON.stringify(saved.payload)) } catch { /* cloud copy remains authoritative */ }
