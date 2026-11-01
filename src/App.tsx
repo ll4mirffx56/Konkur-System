@@ -284,7 +284,7 @@ function App() {
     if (!window.confirm('اطلاعات فعلی همین دستگاه در فضای ابری ذخیره و جایگزین نسخهٔ ابری قبلی می‌شود. ادامه می‌دهی؟')) return
     setCloudBusy(true)
     try {
-      const { error } = await supabase.from('user_app_state').upsert({ user_id: cloudSession.user.id, payload: currentCloudPayload(), updated_at: new Date().toISOString() })
+      const { error } = await clinet.from('user_app_state').upsert({ user_id: cloudSession.user.id, payload: currentCloudPayload(), updated_at: new Date().toISOString() })
       if (error) throw error
       setNotice('اطلاعات فعلی این دستگاه در فضای ابری ذخیره شد.')
     } catch (error) { setNotice(error instanceof Error ? `ذخیرهٔ ابری ناموفق بود: ${error.message}` : 'ذخیرهٔ ابری ناموفق بود.') }
