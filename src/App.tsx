@@ -268,7 +268,7 @@ function App() {
 
     const hydrate = async () => {
       try {
-        const { data: row, error } = await clinet.from('user_app_state')
+        const { data: row, error } = await client.from('user_app_state')
           .select('payload, updated_at')
           .eq('user_id', userId)
           .maybeSingle()
