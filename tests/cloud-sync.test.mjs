@@ -31,6 +31,41 @@ test('cloud normalization preserves legacy test records by classifying unassigne
   }]
   const normalized = normalizeCloudPayload(payload)
   assert.equal(normalized.performance[0].blank, 2)
+  assert.deepEqual(normalized.performance[0].exams, [{ subject: 'همه درس‌ها', tests: 10, correct: 6, wrong: 2 }])
+})
+
+
+test('cloud normalization preserves separate subject exam results and calculates blanks per subject', () => {
+  const payload = makeEmptyCloudPayload()
+  payload.performance = [{
+    id: 'p-2026-11-01', date: '2026-11-01', hours: 5, planned: 6, focus: 8,
+    tests: 999, correct: 999, wrong: 0, blank: 0,
+    exams: [
+      { subject: 'شیمی', tests: 40, correct: 30, wrong: 7 },
+      { subject: 'فیزیک', tests: 20, correct: 12, wrong: 3 },
+    ],
+  }]
+  const normalized = normalizeCloudPayload(payload)
+  assert.equal(normalized.performance[0].tests, 60)
+  assert.equal(normalized.performance[0].correct, 42)
+  assert.equal(normalized.performance[0].wrong, 10)
+  assert.equal(normalized.performance[0].blank, 8)
+  assert.deepEqual(normalized.performance[0].exams[0], { subject: 'شیمی', tests: 40, correct: 30, wrong: 7 })
+})
+
+test('cloud normalization rejects duplicate subjects and mixed all-subject plus per-subject entries', () => {
+  const payload = makeEmptyCloudPayload()
+  const base = { id: 'p-2026-11-01', date: '2026-11-01', hours: 5, planned: 6, focus: 8 }
+  payload.performance = [{ ...base, exams: [
+    { subject: 'شیمی', tests: 10, correct: 6, wrong: 2 },
+    { subject: 'شیمی', tests: 5, correct: 3, wrong: 1 },
+  ] }]
+  assert.equal(normalizeCloudPayload(payload), null)
+  payload.performance = [{ ...base, exams: [
+    { subject: 'همه درس‌ها', tests: 10, correct: 6, wrong: 2 },
+    { subject: 'شیمی', tests: 5, correct: 3, wrong: 1 },
+  ] }]
+  assert.equal(normalizeCloudPayload(payload), null)
 })
 
 test('cloud normalization rejects invalid dates, duplicate days, and impossible answer counts', () => {
@@ -48,6 +83,27 @@ test('three-way merge preserves independent changes made on two devices', () => 
   const remote = { ...base, reviews: [review('remote')] }
   const merged = mergeCloudPayloads(base, local, remote)
   assert.deepEqual(merged.reviews.map(item => item.id).sort(), ['local', 'remote'])
+})
+
+
+test('concurrent updates for different subjects on the same day are merged independently', () => {
+  const base = makeEmptyCloudPayload()
+  const day = {
+    id: 'p-2026-11-01', date: '2026-11-01', hours: 5, planned: 6,
+    tests: 10, correct: 6, wrong: 2, blank: 2, focus: 8,
+    exams: [{ subject: 'شیمی', tests: 10, correct: 6, wrong: 2 }],
+  }
+  base.performance = [day]
+  const local = structuredClone(base)
+  local.performance[0].exams.push({ subject: 'فیزیک', tests: 20, correct: 15, wrong: 2 })
+  const remote = structuredClone(base)
+  remote.performance[0].exams.push({ subject: 'حسابان', tests: 30, correct: 20, wrong: 5 })
+  const merged = mergeCloudPayloads(base, local, remote)
+  assert.deepEqual(merged.performance[0].exams.map(exam => exam.subject).sort(), ['حسابان', 'شیمی', 'فیزیک'])
+  assert.equal(merged.performance[0].tests, 60)
+  assert.equal(merged.performance[0].correct, 41)
+  assert.equal(merged.performance[0].wrong, 9)
+  assert.equal(merged.performance[0].blank, 10)
 })
 
 test('a local deletion is retained when the remote record was not changed', () => {

@@ -18,14 +18,16 @@ test('Jalali date entry is converted and round-trip validated', () => {
   assert.match(app, /function jalaliToISO/)
   assert.match(app, /check\.jy !== jy \|\| check\.jm !== jm \|\| check\.jd !== jd/)
   assert.match(app, /<PersianDatePicker label="تاریخ اتمام جلسه" value=\{reviewBaseDateText\} onChange=\{setReviewBaseDateText\} todayDate=\{today\} \/>/)
-  assert.match(app, /<PersianDatePicker label="تاریخ عملکرد" value=\{performanceDateText\} onChange=\{setPerformanceDateText\} todayDate=\{today\} \/>/)
+  assert.match(app, /<PersianDatePicker label="تاریخ عملکرد" value=\{performanceDateText\} onChange=\{changePerformanceDate\} todayDate=\{today\} \/>/)
 })
 
-test('performance entry validates counts and computes real metrics from saved records', () => {
-  assert.match(app, /validateExamCounts\(\{ total: tests, correct, wrong, blank \}\)/)
-  assert.match(app, /setPerformanceRecords\(current => \[\.\.\.current\.filter\(item => item\.date !== parsedPerformanceDate\), entry\]/)
+test('daily performance stores independent subject exams and derives unanswered questions', () => {
+  assert.match(app, /function addSubjectExam\(/)
+  assert.match(app, /const blank = tests - correct - wrong/)
+  assert.match(app, /exams: subjectExams\.map/)
   assert.match(app, /getPerformanceMetrics\(chartPoints\)/)
-  assert.match(app, /درصد آزمون با نمرهٔ منفی/)
+  assert.match(app, /درصد هر درس/)
+  assert.doesNotMatch(app, /<span>نزده<\/span>/)
 })
 
 test('JSON backup and workbook import/export are wired', () => {
@@ -51,4 +53,11 @@ test('documentation explains date source, account-scoped cloud persistence and a
   assert.match(readme, /هدر `Date` پاسخ سایت/)
   assert.match(readme, /Supabase|حساب|فضای ابری/)
   assert.match(readme, /npm test/)
+})
+
+
+test('Jalali years are formatted without thousands separators and legacy grouped years are parsed', () => {
+  assert.match(app, /function formatFaYear\(value: number\).*useGrouping: false/)
+  assert.match(app, /replace\(\/[٬,]\/g, ''\)/)
+  assert.match(app, /formatFaYear\(j\.jy\)/)
 })
