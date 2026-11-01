@@ -2,7 +2,7 @@ name: Build and deploy to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [main, v2-dev]
   workflow_dispatch:
 
 permissions:
@@ -40,7 +40,7 @@ jobs:
         with:
           path: dist
   deploy:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/v2-dev'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
