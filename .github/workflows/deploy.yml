@@ -29,17 +29,16 @@ jobs:
       - name: Run automated tests
         run: npm test
       - name: Build site
-        run: npm run build
         env:
           VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
+        run: npm run build
       - name: Configure Pages
         uses: actions/configure-pages@v5
       - name: Upload website artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: dist
-
   deploy:
     if: github.ref == 'refs/heads/main'
     environment:
