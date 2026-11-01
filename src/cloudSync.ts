@@ -16,6 +16,13 @@ export type CloudReviewItem = {
   tone: string
 }
 
+export type SubjectExamRecord = {
+  subject: string
+  tests: number
+  correct: number
+  wrong: number
+}
+
 export type CloudPerformanceRecord = {
   id: string
   date: string
@@ -26,6 +33,7 @@ export type CloudPerformanceRecord = {
   wrong: number
   blank: number
   focus: number
+  exams: SubjectExamRecord[]
 }
 
 export type CompleteCloudPayload = {
@@ -63,23 +71,46 @@ export function normalizePerformanceRecords(value: unknown): CloudPerformanceRec
 
   for (const raw of value) {
     if (!isRecord(raw)) return null
-    const { id, date, hours, planned, tests, correct, wrong, blank, focus } = raw
+    const { id, date, hours, planned, focus } = raw
     if (
       typeof id !== 'string' || !id || seenIds.has(id) ||
       typeof date !== 'string' || !isValidISODate(date) || seenDates.has(date) ||
       typeof hours !== 'number' || !Number.isFinite(hours) || hours < 0 || hours > 24 ||
       typeof planned !== 'number' || !Number.isFinite(planned) || planned < 0 || planned > 24 ||
-      !isNonNegativeInteger(tests) ||
-      !isNonNegativeInteger(correct) ||
-      !isNonNegativeInteger(wrong) ||
-      !isNonNegativeInteger(blank) ||
       typeof focus !== 'number' || !Number.isInteger(focus) || focus < 0 || focus > 10
     ) return null
 
-    const answered = correct + wrong + blank
-    if (answered > tests) return null
-    // Older versions allowed unanswered questions to remain unclassified.
-    // Treat the remaining questions as blank so old data stays usable and the formula remains valid.
+    let exams: SubjectExamRecord[]
+    if (Array.isArray(raw.exams)) {
+      const seenSubjects = new Set<string>()
+      exams = []
+      for (const rawExam of raw.exams) {
+        if (!isRecord(rawExam)) return null
+        const { subject, tests, correct, wrong } = rawExam
+        if (
+          typeof subject !== 'string' || !subject.trim() || seenSubjects.has(subject.trim()) ||
+          !isNonNegativeInteger(tests) || tests <= 0 ||
+          !isNonNegativeInteger(correct) || !isNonNegativeInteger(wrong) ||
+          correct + wrong > tests
+        ) return null
+        seenSubjects.add(subject.trim())
+        exams.push({ subject: subject.trim(), tests, correct, wrong })
+      }
+      // A whole-day total and subject-level rows are alternative recording modes.
+      if (seenSubjects.has('همه درس‌ها') && exams.length > 1) return null
+    } else {
+      // Backward compatibility: convert the former single daily total into a whole-day row.
+      const { tests, correct, wrong, blank } = raw
+      if (!isNonNegativeInteger(tests) || !isNonNegativeInteger(correct) ||
+          !isNonNegativeInteger(wrong) || !isNonNegativeInteger(blank)) return null
+      const answered = correct + wrong + blank
+      if (answered > tests) return null
+      exams = tests > 0 ? [{ subject: 'همه درس‌ها', tests, correct, wrong }] : []
+    }
+
+    const tests = exams.reduce((sum, exam) => sum + exam.tests, 0)
+    const correct = exams.reduce((sum, exam) => sum + exam.correct, 0)
+    const wrong = exams.reduce((sum, exam) => sum + exam.wrong, 0)
     result.push({
       id,
       date,
@@ -88,8 +119,9 @@ export function normalizePerformanceRecords(value: unknown): CloudPerformanceRec
       tests,
       correct,
       wrong,
-      blank: blank + (tests - answered),
+      blank: tests - correct - wrong,
       focus,
+      exams,
     })
     seenIds.add(id)
     seenDates.add(date)
@@ -184,6 +216,75 @@ function mergeIdentified<T extends Identified>(base: T[], local: T[], remote: T[
   return result
 }
 
+function mergePerformanceRecords(
+  base: CloudPerformanceRecord[],
+  local: CloudPerformanceRecord[],
+  remote: CloudPerformanceRecord[],
+): CloudPerformanceRecord[] {
+  const baseMap = new Map(base.map(item => [item.id, item]))
+  const localMap = new Map(local.map(item => [item.id, item]))
+  const remoteMap = new Map(remote.map(item => [item.id, item]))
+  const order = [...new Set([...remote.map(item => item.id), ...local.map(item => item.id), ...base.map(item => item.id)])]
+  const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+  const result: CloudPerformanceRecord[] = []
+
+  for (const id of order) {
+    const before = baseMap.get(id)
+    const localValue = localMap.get(id)
+    const remoteValue = remoteMap.get(id)
+    const localChanged = !equal(localValue, before)
+    const remoteChanged = !equal(remoteValue, before)
+    if (!localChanged) { if (remoteValue) result.push(remoteValue); continue }
+    if (!remoteChanged || equal(localValue, remoteValue)) { if (localValue) result.push(localValue); continue }
+    if (!localValue || !remoteValue) { if (localValue) result.push(localValue); continue }
+
+    const baseExams = new Map((before?.exams ?? []).map(exam => [exam.subject, exam]))
+    const localExams = new Map(localValue.exams.map(exam => [exam.subject, exam]))
+    const remoteExams = new Map(remoteValue.exams.map(exam => [exam.subject, exam]))
+    const subjectOrder = [...new Set([
+      ...remoteValue.exams.map(exam => exam.subject),
+      ...localValue.exams.map(exam => exam.subject),
+      ...(before?.exams ?? []).map(exam => exam.subject),
+    ])]
+    let exams = subjectOrder.flatMap(subject => {
+      const prior = baseExams.get(subject)
+      const left = localExams.get(subject)
+      const right = remoteExams.get(subject)
+      const leftChanged = !equal(left, prior)
+      const rightChanged = !equal(right, prior)
+      const chosen = !leftChanged ? right : !rightChanged || equal(left, right) ? left : left
+      return chosen ? [chosen] : []
+    })
+
+    // Whole-day totals cannot be mixed with individual subjects; prefer the local
+    // side in this conflicting mode change, matching the app's existing conflict policy.
+    const localUsesWholeDay = localValue.exams.some(exam => exam.subject === 'همه درس‌ها')
+    const remoteUsesWholeDay = remoteValue.exams.some(exam => exam.subject === 'همه درس‌ها')
+    if ((localUsesWholeDay && exams.some(exam => exam.subject !== 'همه درس‌ها')) ||
+        (remoteUsesWholeDay && exams.some(exam => exam.subject !== 'همه درس‌ها'))) {
+      exams = localUsesWholeDay ? localValue.exams : remoteValue.exams
+    }
+
+    const tests = exams.reduce((sum, exam) => sum + exam.tests, 0)
+    const correct = exams.reduce((sum, exam) => sum + exam.correct, 0)
+    const wrong = exams.reduce((sum, exam) => sum + exam.wrong, 0)
+    const value: CloudPerformanceRecord = {
+      id,
+      date: localValue.date,
+      hours: localValue.hours !== before?.hours ? localValue.hours : remoteValue.hours,
+      planned: localValue.planned !== before?.planned ? localValue.planned : remoteValue.planned,
+      focus: localValue.focus !== before?.focus ? localValue.focus : remoteValue.focus,
+      tests,
+      correct,
+      wrong,
+      blank: tests - correct - wrong,
+      exams,
+    }
+    result.push(value)
+  }
+  return result.sort((a, b) => a.date.localeCompare(b.date))
+}
+
 export function mergeCloudPayloads(
   base: CompleteCloudPayload,
   local: CompleteCloudPayload,
@@ -193,7 +294,7 @@ export function mergeCloudPayloads(
   return {
     version: 1,
     reviews: mergeIdentified(base.reviews, local.reviews, remote.reviews),
-    performance: mergeIdentified(base.performance, local.performance, remote.performance),
+    performance: mergePerformanceRecords(base.performance, local.performance, remote.performance),
     intervals: changed(local.intervals, base.intervals) ? local.intervals : remote.intervals,
     theme: changed(local.theme, base.theme) ? local.theme : remote.theme,
     panelOrder: changed(local.panelOrder, base.panelOrder) ? local.panelOrder : remote.panelOrder,

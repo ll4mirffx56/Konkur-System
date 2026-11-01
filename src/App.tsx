@@ -5,7 +5,7 @@ import { cloudConfigured, supabase } from './cloud'
 import { makeEmptyCloudPayload, mergeCloudPayloads, normalizeCloudPayload, saveCloudStateSafely, normalizePerformanceRecords, type CompleteCloudPayload } from './cloudSync'
 import { jalaaliMonthLength, toGregorian, toJalaali } from 'jalaali-js'
 import { addDaysISO, buildReviewSchedule, createLineChartGeometry, daysUntilISO, filterCommandItems, getPerformanceMetrics, isValidISODate, matchesReviewFilters, reorderPanels, type PanelKey } from './logic'
-import { DEFAULT_STUDY_GOALS, calculateExamPercentage, validateExamCounts, validateStudyGoals, type StudyGoalSettings, type ExamCounts } from './goalExam'
+import { DEFAULT_STUDY_GOALS, calculateExamPercentage, validateStudyGoals, type StudyGoalSettings, type ExamCounts } from './goalExam'
 import {
   Activity, ArrowDownLeft, Bell, BookOpenCheck, CalendarDays, Check, ChevronLeft, ChevronRight,
   CircleCheck, CircleHelp, Clock3, Command, Download, FileSpreadsheet, Flame, GripVertical,
@@ -18,9 +18,10 @@ type ReviewItem = {
   id: string; subject: string; title: string; stage: string; stageIndex: number; interval: number;
   baseDate: string; dueDate: string; done: boolean; doneAt: string | null; tone: string
 }
+type SubjectExamRecord = { subject: string; tests: number; correct: number; wrong: number }
 type PerformanceRecord = {
   id: string; date: string; hours: number; planned: number; tests: number; correct: number;
-  wrong: number; blank: number; focus: number
+  wrong: number; blank: number; focus: number; exams: SubjectExamRecord[]
 }
 type PerformancePoint = PerformanceRecord & { day: string }
 type CommandItem = { id: string; label: string; description: string; keywords: string; run: () => void; icon: typeof LayoutDashboard }
@@ -48,6 +49,7 @@ function readStored<T>(key: string, fallback: T): T {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) as T : fallback } catch { return fallback }
 }
 function formatFa(value: number): string { return Number.isFinite(value) ? value.toLocaleString('fa-IR', { maximumFractionDigits: 1 }) : '۰' }
+function formatFaYear(value: number): string { return value.toLocaleString('fa-IR', { useGrouping: false }) }
 function todayISO(): string { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` }
 function serverDateInTehran(header: string): string | null {
   const date = new Date(header)
@@ -60,7 +62,7 @@ function serverDateInTehran(header: string): string | null {
   } catch { return null }
 }
 function toLatinDigits(value: string): string {
-  return value.replace(/[۰-۹]/g, digit => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(digit))).replace(/[٠-٩]/g, digit => String('٠١٢٣٤٥٦٧٨٩'.indexOf(digit))).replace(/٫/g, '.').replace(/٬/g, ',')
+  return value.replace(/[۰-۹]/g, digit => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(digit))).replace(/[٠-٩]/g, digit => String('٠١٢٣٤٥٦٧٨٩'.indexOf(digit))).replace(/٫/g, '.').replace(/[٬,]/g, '')
 }
 function jalaliToISO(value: unknown): string | null {
   const text = toLatinDigits(String(value ?? '')).trim()
@@ -73,7 +75,7 @@ function jalaliToISO(value: unknown): string | null {
 function isoToJalali(iso: string, short = false): string {
   if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return '—'
   const [gy, gm, gd] = iso.split('-').map(Number)
-  try { const j = toJalaali(gy, gm, gd); return short ? `${formatFa(j.jd)} ${PERSIAN_MONTHS[j.jm - 1]}` : `${formatFa(j.jy)}/${formatFa(j.jm).padStart(2, '۰')}/${formatFa(j.jd).padStart(2, '۰')}` } catch { return iso }
+  try { const j = toJalaali(gy, gm, gd); return short ? `${formatFa(j.jd)} ${PERSIAN_MONTHS[j.jm - 1]}` : `${formatFaYear(j.jy)}/${formatFa(j.jm).padStart(2, '۰')}/${formatFa(j.jd).padStart(2, '۰')}` } catch { return iso }
 }
 function getDueDays(item: ReviewItem, today: string): number { return daysUntilISO(item.dueDate, today) }
 function getDueLabel(item: ReviewItem, today: string): string {
@@ -123,7 +125,7 @@ function readPerformanceRecords(): PerformanceRecord[] {
 }
 
 function formatJalaliDate(year: number, month: number, day: number): string {
-  return `${formatFa(year)}/${formatFa(month).padStart(2, '۰')}/${formatFa(day).padStart(2, '۰')}`
+  return `${formatFaYear(year)}/${formatFa(month).padStart(2, '۰')}/${formatFa(day).padStart(2, '۰')}`
 }
 
 function App() {
@@ -171,10 +173,11 @@ function App() {
   const [performanceDateText, setPerformanceDateText] = useState(isoToJalali(todayISO()))
   const [performanceHours, setPerformanceHours] = useState('')
   const [plannedHours, setPlannedHours] = useState('')
-  const [testCount, setTestCount] = useState('')
-  const [correctCount, setCorrectCount] = useState('')
-  const [wrongCount, setWrongCount] = useState('')
-  const [blankCount, setBlankCount] = useState('')
+  const [examSubject, setExamSubject] = useState('شیمی')
+  const [examTotal, setExamTotal] = useState('')
+  const [examCorrect, setExamCorrect] = useState('')
+  const [examWrong, setExamWrong] = useState('')
+  const [subjectExams, setSubjectExams] = useState<SubjectExamRecord[]>([])
   const [focusScore, setFocusScore] = useState('7')
   const commandInputRef = useRef<HTMLInputElement>(null)
   const importInputRef = useRef<HTMLInputElement>(null)
@@ -195,6 +198,7 @@ function App() {
   const cloudUserDataReady = Boolean(cloudSession?.user.id && cloudHydrated && cloudHydratedUserId === cloudSession.user.id)
   livePayloadRef.current = { version: 1, reviews: reviewRecords, performance: performanceRecords, intervals, theme, panelOrder, reduceMotion, studyGoals }
   const subjects = Array.from(new Set(reviews.map(item => item.subject)))
+  const performanceSubjects = Array.from(new Set(['شیمی', 'فیزیک', 'حسابان', 'هندسه', 'گسسته', 'آمار و احتمال', 'فارسی', 'عربی', 'دینی', 'زبان', ...subjects, ...performanceRecords.flatMap(item => item.exams.map(exam => exam.subject)), 'همه درس‌ها']))
 
   useEffect(() => {
     let cancelled = false
@@ -402,28 +406,94 @@ function App() {
   function openNewReview() {
     setReviewTitle(''); setReviewBaseDateText(isoToJalali(today)); setShowReviewForm(true)
   }
+  function resetPerformanceFormFields() {
+    setPerformanceHours('')
+    setPlannedHours('')
+    setExamSubject('شیمی')
+    setExamTotal('')
+    setExamCorrect('')
+    setExamWrong('')
+    setSubjectExams([])
+    setFocusScore('7')
+  }
+  function loadPerformanceRecord(record?: PerformanceRecord) {
+    if (!record) { resetPerformanceFormFields(); return }
+    setPerformanceHours(String(record.hours))
+    setPlannedHours(String(record.planned))
+    setSubjectExams(record.exams.map(exam => ({ ...exam })))
+    setExamSubject(record.exams.some(exam => exam.subject === 'همه درس‌ها') ? 'همه درس‌ها' : 'شیمی')
+    setExamTotal('')
+    setExamCorrect('')
+    setExamWrong('')
+    setFocusScore(String(record.focus))
+  }
   function openNewPerformance() {
-    setPerformanceDateText(isoToJalali(today)); setPerformanceHours(''); setPlannedHours(''); setTestCount(''); setCorrectCount(''); setWrongCount(''); setBlankCount(''); setFocusScore('7'); setShowPerformanceForm(true)
+    const dateText = isoToJalali(today)
+    setPerformanceDateText(dateText)
+    loadPerformanceRecord(performanceRecords.find(item => item.date === today))
+    setShowPerformanceForm(true)
+  }
+  function changePerformanceDate(value: string) {
+    setPerformanceDateText(value)
+    const iso = jalaliToISO(value)
+    loadPerformanceRecord(iso ? performanceRecords.find(item => item.date === iso) : undefined)
+  }
+  function addSubjectExam() {
+    const total = Number(toLatinDigits(examTotal || '0'))
+    const correct = Number(toLatinDigits(examCorrect || '0'))
+    const wrong = Number(toLatinDigits(examWrong || '0'))
+    if (![total, correct, wrong].every(value => Number.isInteger(value) && value >= 0) || total <= 0) {
+      setNotice('کل تست‌ها باید عدد صحیح بزرگ‌تر از صفر باشد و صحیح و غلط نیز عدد صحیح نامنفی باشند.')
+      return
+    }
+    if (correct + wrong > total) {
+      setNotice('مجموع صحیح و غلط نمی‌تواند از کل تست‌ها بیشتر باشد؛ اختلاف آن‌ها با کل، تعداد نزده است.')
+      return
+    }
+    const alreadyHasAll = subjectExams.some(exam => exam.subject === 'همه درس‌ها')
+    if ((examSubject === 'همه درس‌ها' && subjectExams.some(exam => exam.subject !== 'همه درس‌ها')) || (examSubject !== 'همه درس‌ها' && alreadyHasAll)) {
+      setNotice('ثبت «همهٔ درس‌ها» و ثبت جداگانهٔ درس‌ها برای یک روز قابل ترکیب نیست؛ یکی از دو روش را انتخاب کن.')
+      return
+    }
+    const nextExam = { subject: examSubject, tests: total, correct, wrong }
+    setSubjectExams(current => current.some(exam => exam.subject === examSubject)
+      ? current.map(exam => exam.subject === examSubject ? nextExam : exam)
+      : [...current, nextExam])
+    setExamTotal('')
+    setExamCorrect('')
+    setExamWrong('')
+    setNotice(`آمار ${examSubject} اضافه شد؛ نزده به‌صورت خودکار ${formatFa(total - correct - wrong)} محاسبه شد.`)
   }
   function savePerformance(event: FormEvent) {
     event.preventDefault()
-    const numeric = [performanceHours, plannedHours, testCount, correctCount, wrongCount, blankCount, focusScore].map(value => Number(value || 0))
-    if (numeric.some(value => !Number.isFinite(value) || value < 0)) { setNotice('مقادیر باید عددی و نامنفی باشند.'); return }
-    const [hours, planned, tests, correct, wrong, blank, focus] = numeric
+    const hours = Number(toLatinDigits(performanceHours || '0'))
+    const planned = Number(toLatinDigits(plannedHours || '0'))
+    const focus = Number(toLatinDigits(focusScore || '0'))
+    if ([hours, planned, focus].some(value => !Number.isFinite(value) || value < 0)) { setNotice('مقادیر باید عددی و نامنفی باشند.'); return }
+    if (focus > 10 || !Number.isInteger(focus) || hours > 24 || planned > 24) { setNotice('تمرکز باید بین ۰ تا ۱۰ و ساعت‌ها حداکثر ۲۴ باشند.'); return }
+    if (examTotal.trim() || examCorrect.trim() || examWrong.trim()) {
+      setNotice('آمار واردشده هنوز به فهرست درس‌ها اضافه نشده است؛ ابتدا «افزودن آمار درس» را بزن.')
+      return
+    }
     const parsedPerformanceDate = jalaliToISO(performanceDateText)
     if (!parsedPerformanceDate) { setNotice('تاریخ جلالی معتبر وارد کن؛ قالب نمونه ۱۴۰۵/۰۸/۰۵ است.'); return }
-    if (focus > 10 || !Number.isInteger(focus) || hours > 24 || planned > 24 || !Number.isInteger(tests) || !Number.isInteger(correct) || !Number.isInteger(wrong) || !Number.isInteger(blank)) { setNotice('تمرکز باید بین ۰ تا ۱۰ و تعداد تست‌ها عدد صحیح باشد.'); return }
-    let examPercent: number | null = null
-    if (tests === 0) {
-      if (correct !== 0 || wrong !== 0 || blank !== 0) { setNotice('اگر کل تست‌ها صفر است، تعداد صحیح، غلط و نزده نیز باید صفر باشد.'); return }
-    } else {
-      try { validateExamCounts({ total: tests, correct, wrong, blank }) } catch { setNotice('مجموع پاسخ‌های صحیح، غلط و نزده باید دقیقاً برابر کل تست‌ها باشد.'); return }
-      examPercent = calculateExamPercentage({ total: tests, correct, wrong, blank })
+    const tests = subjectExams.reduce((sum, exam) => sum + exam.tests, 0)
+    const correct = subjectExams.reduce((sum, exam) => sum + exam.correct, 0)
+    const wrong = subjectExams.reduce((sum, exam) => sum + exam.wrong, 0)
+    const blank = tests - correct - wrong
+    const entry: PerformanceRecord = {
+      id: `p-${parsedPerformanceDate}`, date: parsedPerformanceDate, hours, planned,
+      tests, correct, wrong, blank, focus, exams: subjectExams.map(exam => ({ ...exam })),
     }
-    const entry: PerformanceRecord = { id: `p-${parsedPerformanceDate}`, date: parsedPerformanceDate, hours, planned, tests, correct, wrong, blank, focus }
     setPerformanceRecords(current => [...current.filter(item => item.date !== parsedPerformanceDate), entry].sort((a, b) => a.date.localeCompare(b.date)))
-    setShowPerformanceForm(false); setNotice(examPercent === null ? 'عملکرد ذخیره شد؛ امروز تستی ثبت نشده است.' : `عملکرد ذخیره شد؛ درصد آزمون با نمرهٔ منفی: ${formatFa(Math.round(examPercent * 10) / 10)}٪`)
+    setShowPerformanceForm(false)
+    if (tests === 0) setNotice('عملکرد روزانه ذخیره شد؛ برای این روز آمار آزمونی ثبت نشده است.')
+    else {
+      const percentage = calculateExamPercentage({ total: tests, correct, wrong, blank })
+      setNotice(`عملکرد ذخیره شد؛ درصد تجمیعی ${formatFa(Math.round(percentage * 10) / 10)}٪ از ${formatFa(subjectExams.length)} بخش آزمونی.`)
+    }
   }
+
   async function cloudSignIn(event: FormEvent) {
     event.preventDefault()
     if (!supabase) { setNotice('اتصال ابری هنوز تنظیم نشده است. ابتدا متغیرهای محیطی Supabase را تنظیم کن.'); return }
@@ -524,8 +594,15 @@ function App() {
       const statuses = stages.map(item => item?.done ? 'انجام شد' : 'انجام نشده')
       reviewRows.push([first.subject, first.title, isoToJalali(first.baseDate), ...dates, stages.every(item => item?.done) ? 'تکمیل‌شده' : 'در جریان', ...statuses])
     })
-    const perfRows: (string | number)[][] = [['گزارش عملکرد مطالعه'], [], ['تاریخ', 'ساعت مطالعه', 'ساعت برنامه', 'تعداد تست', 'صحیح', 'غلط', 'نزده', 'تمرکز (۰ تا ۱۰)', 'درصد آزمون با نمرهٔ منفی']]
-    performanceRecords.forEach(item => perfRows.push([isoToJalali(item.date), item.hours, item.planned, item.tests, item.correct, item.wrong, item.blank, item.focus, item.tests > 0 ? Math.round(calculateExamPercentage({ total: item.tests, correct: item.correct, wrong: item.wrong, blank: item.blank }) * 10) / 10 : '']))
+    const perfRows: (string | number)[][] = [['گزارش عملکرد مطالعه'], [], ['تاریخ', 'درس', 'ساعت مطالعه', 'ساعت برنامه', 'کل تست‌ها', 'صحیح', 'غلط', 'نزده (محاسبه‌شده)', 'درصد آزمون با نمرهٔ منفی', 'تمرکز (۰ تا ۱۰)']]
+    performanceRecords.forEach(item => {
+      const exams = item.exams.length ? item.exams : [{ subject: '—', tests: 0, correct: 0, wrong: 0 }]
+      exams.forEach(exam => {
+        const blank = exam.tests - exam.correct - exam.wrong
+        const percent = exam.tests > 0 ? Math.round(calculateExamPercentage({ total: exam.tests, correct: exam.correct, wrong: exam.wrong, blank }) * 10) / 10 : ''
+        perfRows.push([isoToJalali(item.date), exam.subject, item.hours, item.planned, exam.tests, exam.correct, exam.wrong, blank, percent, item.focus])
+      })
+    })
     const settingsRows: (string | number)[][] = [['تنظیمات'], [], ['سال', 1406], ...intervals.map((value, index) => [`فاصله مرور ${index + 1}`, value]), ['هدف ساعت هفتگی', studyGoals.weeklyHours], ['هدف ساعت ماهانه', studyGoals.monthlyHours]]
     const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(reviewRows), 'مرور'); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(perfRows), 'عملکرد'); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(settingsRows), 'تنظیمات')
     XLSX.writeFile(wb, `moroor-export-${today}.xlsx`); setNotice('فایل اکسل خروجی ساخته شد.')
@@ -585,12 +662,29 @@ function App() {
         if (performanceSheet) {
           const rows = XLSX.utils.sheet_to_json<unknown[]>(performanceSheet, { header: 1, raw: true, defval: '' })
           const note = String(rows[1]?.[0] ?? '')
+          const header = (rows[2] ?? []).map(value => toLatinDigits(String(value ?? '')).trim())
+          const isSubjectFormat = header.includes('درس') && header.includes('کل تست‌ها')
+          const grouped = new Map<string, PerformanceRecord>()
           rows.slice(3).forEach((row, rowIndex) => {
             const date = parseExcelDate(row[0]); if (!date) return
             if (rowIndex === 0 && /نمونه|مثال/.test(note)) return
             const n = (index: number) => Math.max(0, Number(toLatinDigits(String(row[index] ?? 0)).replace(/,/g, '')) || 0)
-            importedPerformance.push({ id: `import-p-${date}`, date, hours: n(1), planned: n(2), tests: n(3), correct: n(4), wrong: n(5), blank: n(6), focus: Math.min(10, n(7)) })
+            const existing = grouped.get(date)
+            if (isSubjectFormat) {
+              const subject = String(row[1] ?? '').trim()
+              const tests = n(4), correct = n(5), wrong = n(6)
+              const record = existing ?? { id: `import-p-${date}`, date, hours: n(2), planned: n(3), tests: 0, correct: 0, wrong: 0, blank: 0, focus: Math.min(10, n(9)), exams: [] }
+              if (subject && subject !== '—' && tests > 0 && correct + wrong <= tests) {
+                record.exams = [...record.exams.filter(exam => exam.subject !== subject), { subject, tests, correct, wrong }]
+              }
+              grouped.set(date, record)
+            } else {
+              const tests = n(3), correct = n(4), wrong = n(5), blank = n(6)
+              if (correct + wrong + blank > tests) return
+              grouped.set(date, { id: `import-p-${date}`, date, hours: n(1), planned: n(2), tests, correct, wrong, blank, focus: Math.min(10, n(7)), exams: tests > 0 ? [{ subject: 'همه درس‌ها', tests, correct, wrong }] : [] })
+            }
           })
+          importedPerformance.push(...grouped.values())
         }
         if (!reviewSheet && !performanceSheet) throw new Error('missing sheets')
         const normalizedPerformance = normalizePerformanceRecords(importedPerformance)
@@ -682,7 +776,7 @@ function App() {
         <section className="welcome-row"><div><div className="eyebrow"><span className="status-dot" /> گزارش و تحلیل <span className="live-pill">داده‌های ثبت‌شده</span></div><h1>عملکرد <span>مطالعه</span></h1><p className="page-subtitle">ساعت مطالعه، تست‌ها، دقت پاسخ‌گویی و اجرای برنامه از رکوردهای خودت.</p></div><div className="welcome-actions"><div className="range-switch" role="group" aria-label="بازهٔ نمودار"><button className={chartRange === 7 ? 'selected' : ''} onClick={() => setChartRange(7)}>۷ روز</button><button className={chartRange === 30 ? 'selected' : ''} onClick={() => setChartRange(30)}>۳۰ روز</button></div><button className="primary-button" onClick={openNewPerformance}><Plus size={16} /> ثبت روز</button></div></section>
         <section className="stats-grid performance-stats"><StatCard title="مجموع ساعت مطالعه" value={formatFa(currentMetrics.hours)} suffix="ساعت" delta={`${formatFa(selectedPerformance.length)} روز ثبت‌شده`} icon={Clock3} color="blue" progress={(chartRange === 7 ? studyGoals.weeklyHours : studyGoals.monthlyHours) > 0 ? Math.min(100, currentMetrics.hours / (chartRange === 7 ? studyGoals.weeklyHours : studyGoals.monthlyHours) * 100) : (currentMetrics.hours > 0 ? 100 : 0)} /><StatCard title="مجموع تست‌ها" value={formatFa(currentMetrics.tests)} suffix="تست" delta="تعداد کل ثبت‌شده" icon={Target} color="violet" progress={Math.min(100, currentMetrics.tests / (chartRange === 7 ? 250 : 1500) * 100)} /><StatCard title="میانگین روز ثبت‌شده" value={formatFa(currentMetrics.averageHours)} suffix="ساعت" delta="فقط روزهای دارای رکورد" icon={TrendingUp} color="green" progress={Math.min(100, currentMetrics.averageHours / 8 * 100)} /><StatCard title="درصد آزمون با نمرهٔ منفی" value={formatFa(Math.round(examPercentage * 10) / 10)} suffix="٪" delta="(صحیح × ۳ − غلط) ÷ (کل × ۳)" icon={CircleCheck} color="amber" progress={Math.max(0, Math.min(100, examPercentage))} /><StatCard title="اجرای برنامه" value={`${formatFa(Math.round(currentMetrics.planExecution))}`} suffix="٪" delta="میانگین ساعت واقعی ÷ برنامه" icon={Target} color="violet" progress={currentMetrics.planExecution} /><StatCard title="میانگین تمرکز" value={formatFa(currentMetrics.averageFocus)} suffix="/۱۰" delta="میانگین روزهای ثبت‌شده" icon={Zap} color="blue" progress={currentMetrics.averageFocus * 10} /></section>
         <section className="panel performance-chart-panel"><div className="panel-heading"><div><div className="section-kicker">TREND ANALYSIS</div><h2>{chartMetric === 'hours' ? 'روند ساعت مطالعه' : 'روند تعداد تست'}</h2><p>فقط رکوردهای واقعی ثبت‌شده برای این حساب نمایش داده می‌شوند.</p></div><div className="metric-switch"><button className={chartMetric === 'hours' ? 'selected' : ''} onClick={() => setChartMetric('hours')}><Clock3 size={14} /> ساعت</button><button className={chartMetric === 'tests' ? 'selected' : ''} onClick={() => setChartMetric('tests')}><Target size={14} /> تست</button></div></div>{chartPoints.length ? <LineChart points={chartPoints} metric={chartMetric} /> : <div className="empty-state chart-empty"><span><Activity size={22} /></span><strong>هنوز داده‌ای برای نمودار وجود ندارد</strong><p>اولین رکورد روزانه‌ات را ثبت کن تا روند عملکرد نمایش داده شود.</p><button className="secondary-button" onClick={() => setShowPerformanceForm(true)}>ثبت عملکرد</button></div>}</section>
-        <section className="panel performance-table-panel"><div className="table-panel-heading"><div><h2>ثبت‌های روزانه</h2><p>برای هر تاریخ یک رکورد نگه داشته می‌شود؛ ثبت دوباره همان روز آن را به‌روزرسانی می‌کند.</p></div><span className="table-count">{formatFa(selectedPerformance.length)} روز</span></div>{selectedPerformance.length ? <div className="performance-table">{[...selectedPerformance].reverse().map(item => <div className="performance-row" key={item.id}><strong>{isoToJalali(item.date)}</strong><span>{formatFa(item.hours)} ساعت</span><span>{formatFa(item.tests)} تست</span><span>صحیح {formatFa(item.correct)} · غلط {formatFa(item.wrong)} · نزده {formatFa(item.blank)} · درصد آزمون {formatFa(item.tests > 0 ? Math.round(calculateExamPercentage({ total: item.tests, correct: item.correct, wrong: item.wrong, blank: item.blank }) * 10) / 10 : 0)}٪</span><span>تمرکز {formatFa(item.focus)}/۱۰</span><span>تست/ساعت {formatFa(item.hours > 0 ? item.tests / item.hours : 0)}</span><button className="row-more" onClick={() => { setPerformanceDateText(isoToJalali(item.date)); setPerformanceHours(String(item.hours)); setPlannedHours(String(item.planned)); setTestCount(String(item.tests)); setCorrectCount(String(item.correct)); setWrongCount(String(item.wrong)); setBlankCount(String(item.blank)); setFocusScore(String(item.focus)); setShowPerformanceForm(true) }} aria-label="ویرایش عملکرد"><MoreHorizontal size={18} /></button><button className="row-more" onClick={() => { if (window.confirm(`رکورد ${isoToJalali(item.date)} حذف شود؟`)) setPerformanceRecords(current => current.filter(row => row.id !== item.id)) }} aria-label="حذف عملکرد"><Trash2 size={15} /></button></div>)}</div> : <div className="empty-state"><span><CalendarDays size={22} /></span><strong>هنوز رکوردی در این بازه ثبت نشده</strong><p>برای هر روز، ساعت برنامه و واقعی و آمار تست‌ها را وارد کن.</p></div>}</section>
+        <section className="panel performance-table-panel"><div className="table-panel-heading"><div><h2>ثبت‌های روزانه</h2><p>برای هر تاریخ یک رکورد روزانه نگه داشته می‌شود؛ آمار هر درس جداگانه نمایش داده می‌شود.</p></div><span className="table-count">{formatFa(selectedPerformance.length)} روز</span></div>{selectedPerformance.length ? <div className="performance-table">{[...selectedPerformance].reverse().map(item => <div className="performance-row" key={item.id}><div className="performance-row-main"><strong>{isoToJalali(item.date)}</strong><span>{formatFa(item.hours)} ساعت مطالعه · {formatFa(item.planned)} ساعت برنامه</span><span>{formatFa(item.tests)} تست در مجموع · تمرکز {formatFa(item.focus)}/۱۰ · تست/ساعت {formatFa(item.hours > 0 ? item.tests / item.hours : 0)}</span></div><div className="performance-exams">{item.exams.length ? item.exams.map(exam => { const blank = exam.tests - exam.correct - exam.wrong; const percent = calculateExamPercentage({ total: exam.tests, correct: exam.correct, wrong: exam.wrong, blank }); return <div className="performance-exam" key={`${item.id}-${exam.subject}`}><strong>{exam.subject}</strong><span>{formatFa(exam.tests)} تست</span><span>صحیح {formatFa(exam.correct)}</span><span>غلط {formatFa(exam.wrong)}</span><span>نزده {formatFa(blank)}</span><b>درصد {formatFa(Math.round(percent * 10) / 10)}٪</b></div> }) : <span className="performance-no-exams">برای این روز آزمونی ثبت نشده است.</span>}</div><div className="performance-row-actions"><button className="row-more" onClick={() => { setPerformanceDateText(isoToJalali(item.date)); loadPerformanceRecord(item); setShowPerformanceForm(true) }} aria-label="ویرایش عملکرد"><MoreHorizontal size={18} /></button><button className="row-more" onClick={() => { if (window.confirm(`رکورد ${isoToJalali(item.date)} حذف شود؟`)) setPerformanceRecords(current => current.filter(row => row.id !== item.id)) }} aria-label="حذف عملکرد"><Trash2 size={15} /></button></div></div>)}</div> : <div className="empty-state"><span><CalendarDays size={22} /></span><strong>هنوز رکوردی در این بازه ثبت نشده</strong><p>برای هر روز ساعت مطالعه و آمار هر درس را جداگانه وارد کن.</p></div>}</section>
         <section className="panel note-panel"><span className="note-icon"><CircleHelp size={17} /></span><div><strong>نحوهٔ محاسبه</strong><p>درصد آزمون = ((صحیح × ۳) − غلط) ÷ (کل تست‌ها × ۳) × ۱۰۰؛ پاسخ نزده امتیاز صفر دارد. تعداد صحیح، غلط و نزده باید دقیقاً برابر کل تست‌ها باشد. اجرای برنامه نیز از میانگین ساعت واقعی نسبت به ساعت برنامه محاسبه می‌شود.</p></div></section>
       </div>}
 
@@ -708,7 +802,7 @@ function App() {
 
     {showReviewForm && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setShowReviewForm(false) }}><form className="data-modal" onSubmit={addStudyItem} role="dialog" aria-modal="true" aria-label="افزودن موضوع مرور"><div className="data-modal-heading"><div><h2>افزودن موضوع برای مرور</h2><p>پنج موعد بر اساس فاصله‌های تنظیم‌شده ساخته می‌شود.</p></div><button type="button" className="icon-button" onClick={() => setShowReviewForm(false)} aria-label="بستن"><X size={17} /></button></div><label className="form-field"><span>درس</span><select value={reviewSubject} onChange={event => setReviewSubject(event.target.value)}>{subjectsForForm.map(subject => <option key={subject}>{subject}</option>)}</select></label><label className="form-field"><span>جلسه یا موضوع</span><input value={reviewTitle} onChange={event => setReviewTitle(event.target.value)} placeholder="مثلاً استوکیومتری — جلسه ۸" required autoFocus /></label><PersianDatePicker label="تاریخ اتمام جلسه" value={reviewBaseDateText} onChange={setReviewBaseDateText} todayDate={today} /><div className="form-info"><CalendarDays size={15} /><span>موعدها: {intervals.map(value => `${formatFa(value)} روز`).join('، ')} پس از تاریخ شروع.</span></div><div className="form-actions"><button type="button" className="secondary-button" onClick={() => setShowReviewForm(false)}>انصراف</button><button type="submit" className="primary-button"><Plus size={15} /> ساخت موعدها</button></div></form></div>}
 
-    {showPerformanceForm && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setShowPerformanceForm(false) }}><form className="data-modal wide-modal" onSubmit={savePerformance} role="dialog" aria-modal="true" aria-label="ثبت عملکرد مطالعه"><div className="data-modal-heading"><div><h2>ثبت عملکرد روزانه</h2><p>برای هر تاریخ یک رکورد نگه داشته می‌شود.</p></div><button type="button" className="icon-button" onClick={() => setShowPerformanceForm(false)} aria-label="بستن"><X size={17} /></button></div><div className="form-grid"><PersianDatePicker label="تاریخ عملکرد" value={performanceDateText} onChange={setPerformanceDateText} todayDate={today} /><label className="form-field"><span>ساعت مطالعه</span><input type="number" min="0" max="24" step="0.25" value={performanceHours} onChange={event => setPerformanceHours(event.target.value)} placeholder="مثلاً ۵٫۵" required /></label><label className="form-field"><span>ساعت برنامه</span><input type="number" min="0" max="24" step="0.25" value={plannedHours} onChange={event => setPlannedHours(event.target.value)} placeholder="مثلاً ۶" required /></label><label className="form-field"><span>کل تست‌ها</span><input type="number" min="0" step="1" value={testCount} onChange={event => setTestCount(event.target.value)} placeholder="مثلاً ۴۰" required /></label><label className="form-field"><span>صحیح</span><input type="number" min="0" step="1" value={correctCount} onChange={event => setCorrectCount(event.target.value)} placeholder="مثلاً ۳۰" required /></label><label className="form-field"><span>غلط</span><input type="number" min="0" step="1" value={wrongCount} onChange={event => setWrongCount(event.target.value)} placeholder="مثلاً ۷" required /></label><label className="form-field"><span>نزده</span><input type="number" min="0" step="1" value={blankCount} onChange={event => setBlankCount(event.target.value)} placeholder="مثلاً ۳" required /></label><label className="form-field"><span>تمرکز (۰ تا ۱۰)</span><input type="number" min="0" max="10" step="1" value={focusScore} onChange={event => setFocusScore(event.target.value)} required /></label></div><div className="form-info"><CircleHelp size={15} /><span>فرمول درصد: ((صحیح × ۳) − غلط) ÷ (کل تست‌ها × ۳) × ۱۰۰. تعداد صحیح، غلط و نزده باید دقیقاً برابر کل تست‌ها باشد؛ نزده امتیاز صفر دارد.</span></div><div className="form-actions"><button type="button" className="secondary-button" onClick={() => setShowPerformanceForm(false)}>انصراف</button><button type="submit" className="primary-button"><Check size={15} /> ذخیرهٔ عملکرد</button></div></form></div>}
+    {showPerformanceForm && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setShowPerformanceForm(false) }}><form className="data-modal wide-modal" onSubmit={savePerformance} role="dialog" aria-modal="true" aria-label="ثبت عملکرد مطالعه"><div className="data-modal-heading"><div><h2>ثبت عملکرد روزانه</h2><p>برای هر روز یک رکورد ساعت مطالعه و چند ردیف آمار آزمون ثبت کن.</p></div><button type="button" className="icon-button" onClick={() => setShowPerformanceForm(false)} aria-label="بستن"><X size={17} /></button></div><div className="form-grid"><PersianDatePicker label="تاریخ عملکرد" value={performanceDateText} onChange={changePerformanceDate} todayDate={today} /><label className="form-field"><span>ساعت مطالعه</span><input type="number" min="0" max="24" step="0.25" value={performanceHours} onChange={event => setPerformanceHours(event.target.value)} placeholder="مثلاً ۵٫۵" required /></label><label className="form-field"><span>ساعت برنامه</span><input type="number" min="0" max="24" step="0.25" value={plannedHours} onChange={event => setPlannedHours(event.target.value)} placeholder="مثلاً ۶" required /></label><label className="form-field"><span>تمرکز (۰ تا ۱۰)</span><input type="number" min="0" max="10" step="1" value={focusScore} onChange={event => setFocusScore(event.target.value)} required /></label></div><div className="exam-entry-panel"><div className="exam-entry-heading"><div><strong>آمار آزمون هر درس</strong><p>هر درس را جدا اضافه کن؛ برای گزارش کلی می‌توانی «همه درس‌ها» را انتخاب کنی.</p></div></div><div className="exam-entry-grid"><label className="form-field"><span>درس</span><select value={examSubject} onChange={event => setExamSubject(event.target.value)}>{performanceSubjects.map(subject => <option key={subject} value={subject}>{subject}</option>)}</select></label><label className="form-field"><span>کل تست‌ها</span><input type="number" min="1" step="1" value={examTotal} onChange={event => setExamTotal(event.target.value)} placeholder="مثلاً ۴۰" /></label><label className="form-field"><span>صحیح</span><input type="number" min="0" step="1" value={examCorrect} onChange={event => setExamCorrect(event.target.value)} placeholder="مثلاً ۳۰" /></label><label className="form-field"><span>غلط</span><input type="number" min="0" step="1" value={examWrong} onChange={event => setExamWrong(event.target.value)} placeholder="مثلاً ۷" /></label><button type="button" className="secondary-button exam-add-button" onClick={addSubjectExam}><Plus size={15} /> افزودن آمار درس</button></div><div className="form-info"><CircleHelp size={15} /><span>نزده خودکار محاسبه می‌شود: کل تست‌ها − صحیح − غلط. درصد هر درس: ((صحیح × ۳) − غلط) ÷ (کل تست‌ها × ۳) × ۱۰۰. می‌توانی چند درس اضافه کنی؛ «همه درس‌ها» را فقط به‌جای ثبت جداگانهٔ درس‌ها استفاده کن.</span></div>{subjectExams.length > 0 && <div className="exam-entry-list">{subjectExams.map(exam => { const blank = exam.tests - exam.correct - exam.wrong; const percent = calculateExamPercentage({ total: exam.tests, correct: exam.correct, wrong: exam.wrong, blank }); return <div className="exam-entry-row" key={exam.subject}><strong>{exam.subject}</strong><span>{formatFa(exam.tests)} تست</span><span>صحیح {formatFa(exam.correct)}</span><span>غلط {formatFa(exam.wrong)}</span><span>نزده {formatFa(blank)}</span><b>{formatFa(Math.round(percent * 10) / 10)}٪</b><button type="button" className="row-more" onClick={() => setSubjectExams(current => current.filter(item => item.subject !== exam.subject))} aria-label={`حذف آمار ${exam.subject}`}><Trash2 size={15} /></button></div> })}</div>}</div><div className="form-actions"><button type="button" className="secondary-button" onClick={() => setShowPerformanceForm(false)}>انصراف</button><button type="submit" className="primary-button"><Check size={15} /> ذخیرهٔ عملکرد روزانه</button></div></form></div>}
 
     {searchOpen && <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setSearchOpen(false) }}><div className="command-modal" role="dialog" aria-modal="true" aria-label="جست‌وجو و فرمان"><div className="command-input"><Search size={19} /><input ref={commandInputRef} value={commandQuery} onChange={event => setCommandQuery(event.target.value)} onKeyDown={event => { if (event.key === 'ArrowDown') { event.preventDefault(); setCommandIndex(index => Math.min(filteredCommands.length - 1, index + 1)) } else if (event.key === 'ArrowUp') { event.preventDefault(); setCommandIndex(index => Math.max(0, index - 1)) } else if (event.key === 'Enter') { event.preventDefault(); runCommand(filteredCommands[commandIndex]) } }} placeholder="جست‌وجو یا اجرای فرمان..." /><kbd>ESC</kbd><button onClick={() => setSearchOpen(false)} aria-label="بستن"><X size={17} /></button></div><div className="command-label">{commandQuery ? 'نتایج جست‌وجو' : 'فرمان‌های پیشنهادی'}</div><div className="command-results">{filteredCommands.length ? filteredCommands.map((item, index) => { const Icon = item.icon; return <button className={`command-result ${commandIndex === index ? 'selected' : ''}`} key={item.id} onMouseEnter={() => setCommandIndex(index)} onClick={() => runCommand(item)}><Icon size={17} /><span className="command-result-copy"><strong>{item.label}</strong><small>{item.description}</small></span><ArrowDownLeft size={14} /></button> }) : <div className="command-empty">فرمانی با این عبارت پیدا نشد.</div>}</div><div className="command-hint"><span><kbd>↑</kbd><kbd>↓</kbd> حرکت</span><span><kbd>↵</kbd> اجرا</span><span><kbd>ESC</kbd> بستن</span></div></div></div>}
     {notice && <div className="toast" role="status"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="بستن پیام"><X size={16} /></button></div>}
@@ -732,7 +826,7 @@ function PersianDatePicker({ label, value, onChange, todayDate }: { label: strin
   const offset = (new Date(first.gy, first.gm - 1, first.gd).getDay() + 1) % 7
   const days = jalaaliMonthLength(year, month)
   const cells = Array.from({ length: offset + days }, (_, index) => index < offset ? null : index - offset + 1)
-  return <div className="form-field"><span>{label} (شمسی)</span><div className="date-picker-field"><button type="button" className="date-trigger" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(current => !current)}><CalendarDays size={17} /><span>{value || 'انتخاب تاریخ'}</span><ChevronCalendar open={open} /></button>{open && <div className="persian-date-popover" role="dialog" aria-label={`انتخاب ${label}`}><div className="calendar-head"><button type="button" className="calendar-nav" onClick={() => shiftMonth(-1)} aria-label="ماه قبل"><ChevronRight size={16} /></button><strong>{PERSIAN_MONTHS[month - 1]} {formatFa(year)}</strong><button type="button" className="calendar-nav next" onClick={() => shiftMonth(1)} aria-label="ماه بعد"><ChevronLeft size={16} /></button></div><div className="calendar-weekdays">{['ش', 'ی', 'د', 'س', 'چ', 'پ', 'ج'].map(day => <span key={day}>{day}</span>)}</div><div className="calendar-days">{cells.map((day, index) => day === null ? <span key={`empty-${index}`} /> : <button type="button" key={day} className={selected?.jy === year && selected?.jm === month && selected?.jd === day ? 'selected' : ''} onClick={() => { onChange(formatJalaliDate(year, month, day)); setOpen(false) }}>{formatFa(day)}</button>)}</div><div className="calendar-foot"><button type="button" className="text-button" onClick={() => { onChange(formatJalaliDate(todayJalali.jy, todayJalali.jm, todayJalali.jd)); setYear(todayJalali.jy); setMonth(todayJalali.jm); setOpen(false) }}>امروز</button><button type="button" className="text-button" onClick={() => setOpen(false)}>بستن</button></div></div>}</div></div>
+  return <div className="form-field"><span>{label} (شمسی)</span><div className="date-picker-field"><button type="button" className="date-trigger" aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(current => !current)}><CalendarDays size={17} /><span>{value || 'انتخاب تاریخ'}</span><ChevronCalendar open={open} /></button>{open && <div className="persian-date-popover" role="dialog" aria-label={`انتخاب ${label}`}><div className="calendar-head"><button type="button" className="calendar-nav" onClick={() => shiftMonth(-1)} aria-label="ماه قبل"><ChevronRight size={16} /></button><strong>{PERSIAN_MONTHS[month - 1]} {formatFaYear(year)}</strong><button type="button" className="calendar-nav next" onClick={() => shiftMonth(1)} aria-label="ماه بعد"><ChevronLeft size={16} /></button></div><div className="calendar-weekdays">{['ش', 'ی', 'د', 'س', 'چ', 'پ', 'ج'].map(day => <span key={day}>{day}</span>)}</div><div className="calendar-days">{cells.map((day, index) => day === null ? <span key={`empty-${index}`} /> : <button type="button" key={day} className={selected?.jy === year && selected?.jm === month && selected?.jd === day ? 'selected' : ''} onClick={() => { onChange(formatJalaliDate(year, month, day)); setOpen(false) }}>{formatFa(day)}</button>)}</div><div className="calendar-foot"><button type="button" className="text-button" onClick={() => { onChange(formatJalaliDate(todayJalali.jy, todayJalali.jm, todayJalali.jd)); setYear(todayJalali.jy); setMonth(todayJalali.jm); setOpen(false) }}>امروز</button><button type="button" className="text-button" onClick={() => setOpen(false)}>بستن</button></div></div>}</div></div>
 }
 function ChevronCalendar({ open }: { open: boolean }) { return <span className={`calendar-chevron ${open ? 'open' : ''}`}>⌄</span> }
 
