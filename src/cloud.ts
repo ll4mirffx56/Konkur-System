@@ -15,6 +15,7 @@ export type MoroorCloudPayload = {
   theme: 'dark' | 'light'
   panelOrder: string[]
   reduceMotion: boolean
+  studyGoals?: { weeklyHours: number; monthlyHours: number }
 }
 
 export function cloudConfigured(): boolean { return Boolean(supabase) }
